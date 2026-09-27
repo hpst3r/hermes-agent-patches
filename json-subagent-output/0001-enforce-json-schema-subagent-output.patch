@@ -1,0 +1,482 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 4f26ffcf2a..620861b82a 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -212,6 +212,15 @@ SESSION_SEARCH_GUIDANCE = (
+     "asking them to repeat themselves."
+ )
+ 
++DELEGATION_OUTPUT_SCHEMA_GUIDANCE = (
++    "# Structured subagent output\n"
++    "When a delegated task needs machine-readable results, pass an `output_schema` "
++    "to `delegate_task`. Treat that schema as a strict contract for the subagent's "
++    "FINAL response: it must return ONLY one raw JSON value that validates against "
++    "the schema, with no Markdown fence, prose, commentary, or trailing text. Define "
++    "the schema to include every field the parent needs from the child."
++)
++
+ # NOTE (#82154): the opening sentence is worded deliberately. Anthropic's
+ # server-side content filter rejects the previous phrasing ("After completing a
+ # complex task (5+ tool calls), fixing a tricky error, or discovering a
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index b176a2554f..e70c181715 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
+ 
+ from agent.prompt_builder import (
+     DEFAULT_AGENT_IDENTITY,
++    DELEGATION_OUTPUT_SCHEMA_GUIDANCE,
+     EXECUTION_GUIDANCE_MODELS,
+     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+     HERMES_AGENT_HELP_GUIDANCE,
+@@ -435,6 +436,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+     if "skill_manage" in agent.valid_tool_names:
+         tool_guidance.append(SKILLS_GUIDANCE)
++    if "delegate_task" in agent.valid_tool_names:
++        tool_guidance.append(DELEGATION_OUTPUT_SCHEMA_GUIDANCE)
+     # Kanban worker/orchestrator lifecycle — only present when the
+     # dispatcher spawned this process (kanban_show check_fn gates on
+     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index 236d3994c0..ca63373419 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -945,6 +945,32 @@ class TestBuildSystemPrompt:
+         prompt = agent_with_memory_tool._build_system_prompt()
+         assert MEMORY_GUIDANCE in prompt
+ 
++    def test_delegation_schema_guidance_when_delegate_tool_loaded(self):
++        from agent.prompt_builder import DELEGATION_OUTPUT_SCHEMA_GUIDANCE
++
++        with (
++            patch(
++                "run_agent.get_tool_definitions",
++                return_value=_make_tool_defs("delegate_task"),
++            ),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("run_agent.OpenAI"),
++        ):
++            delegated_agent = AIAgent(
++                api_key="test-k...7890",
++                base_url="https://openrouter.ai/api/v1",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++
++        assert DELEGATION_OUTPUT_SCHEMA_GUIDANCE in delegated_agent._build_system_prompt()
++
++    def test_no_delegation_schema_guidance_without_delegate_tool(self, agent):
++        from agent.prompt_builder import DELEGATION_OUTPUT_SCHEMA_GUIDANCE
++
++        assert DELEGATION_OUTPUT_SCHEMA_GUIDANCE not in agent._build_system_prompt()
++
+     def test_no_memory_guidance_when_both_builtin_stores_disabled(
+         self, agent_with_memory_tool
+     ):
+diff --git a/tests/tools/test_delegate_output_schema.py b/tests/tools/test_delegate_output_schema.py
+index 49dfb9e57a..8ffd6ca33c 100644
+--- a/tests/tools/test_delegate_output_schema.py
++++ b/tests/tools/test_delegate_output_schema.py
+@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
+ 
+ from tools.delegate_tool import (
+     DELEGATE_TASK_SCHEMA,
++    _build_child_system_prompt,
+     _run_single_child,
+     delegate_task,
+ )
+@@ -60,16 +61,17 @@ class TestValidateOutput:
+         assert ok is False
+         assert errors
+ 
+-    def test_code_fenced_json_is_accepted(self):
++    def test_code_fenced_json_is_rejected(self):
+         text = '```json\n{"city": "Oslo"}\n```'
+         ok, errors = validate_output(text, ADDRESS_SCHEMA)
+-        assert ok is True
+-        assert errors == []
++        assert ok is False
++        assert errors
+ 
+-    def test_json_embedded_in_prose_is_extracted(self):
++    def test_json_embedded_in_prose_is_rejected(self):
+         text = 'Here is the result:\n{"city": "Lima"}\nHope that helps!'
+-        ok, _ = validate_output(text, ADDRESS_SCHEMA)
+-        assert ok is True
++        ok, errors = validate_output(text, ADDRESS_SCHEMA)
++        assert ok is False
++        assert errors
+ 
+     def test_empty_text_is_invalid(self):
+         ok, errors = validate_output("", ADDRESS_SCHEMA)
+@@ -110,6 +112,53 @@ class TestPromptPlumbing:
+         out = append_output_contract(None, ADDRESS_SCHEMA)
+         assert "OUTPUT CONTRACT" in out
+ 
++    def test_contract_requires_raw_json_without_markdown_fences(self):
++        out = append_output_contract(None, ADDRESS_SCHEMA)
++        assert "ONLY" in out
++        assert "No Markdown" in out
++        assert "code fence is acceptable" not in out
++
++    def test_child_system_prompt_appends_schema_contract_last(self):
++        out = _build_child_system_prompt(
++            "produce the address",
++            "base context",
++            output_schema=ADDRESS_SCHEMA,
++        )
++        assert '"city"' in out
++        assert out.index("Important workspace rule") < out.index(
++            "OUTPUT CONTRACT (machine-validated):"
++        )
++        expected_schema = json.dumps(ADDRESS_SCHEMA, indent=2, ensure_ascii=False)
++        assert out.split("OUTPUT CONTRACT (machine-validated):", 1)[1].rstrip().endswith(
++            expected_schema
++        )
++
++    def test_schema_contract_replaces_conflicting_prose_summary_instructions(self):
++        out = _build_child_system_prompt(
++            "produce the address",
++            output_schema=ADDRESS_SCHEMA,
++        )
++        assert "provide a clear, concise summary" not in out
++        assert "Keep your final summary tight" not in out
++        assert "OUTPUT CONTRACT" in out
++
++    def test_orchestrator_schema_contract_is_after_orchestrator_guidance(self):
++        out = _build_child_system_prompt(
++            "coordinate research",
++            role="orchestrator",
++            max_spawn_depth=3,
++            child_depth=1,
++            output_schema=ADDRESS_SCHEMA,
++        )
++        assert out.index("Subagent Spawning (Orchestrator Role)") < out.index(
++            "OUTPUT CONTRACT (machine-validated):"
++        )
++
++    def test_schema_less_child_prompt_is_unchanged_by_explicit_none(self):
++        assert _build_child_system_prompt("inspect") == _build_child_system_prompt(
++            "inspect", output_schema=None
++        )
++
+     def test_retry_message_carries_verbatim_errors(self):
+         msg = build_retry_message(["'city' is a required property"])
+         assert "'city' is a required property" in msg
+@@ -325,8 +374,8 @@ class TestDelegateTaskDispatch:
+         assert "output_schema" in payload["error"]
+ 
+     def test_child_receives_contract_and_schema_attr(self):
+-        """The built child carries the schema attr and its context gains
+-        the output-contract block."""
++        """The built child carries the schema attr and receives the output
++        contract as a first-class system-prompt input."""
+         captured = {}
+ 
+         def fake_build(**kwargs):
+@@ -358,6 +407,7 @@ class TestDelegateTaskDispatch:
+                 parent_agent=_make_mock_parent(),
+             )
+         payload = json.loads(out)
+-        assert "OUTPUT CONTRACT" in (captured.get("context") or "")
++        assert captured.get("context") == "base context"
++        assert captured.get("output_schema") == ADDRESS_SCHEMA
+         results = payload.get("results") or []
+         assert results and results[0].get("schema_valid") is True
+diff --git a/tests/tools/test_delegate_summary_budget.py b/tests/tools/test_delegate_summary_budget.py
+index a9d826dee6..93a3e8b526 100644
+--- a/tests/tools/test_delegate_summary_budget.py
++++ b/tests/tools/test_delegate_summary_budget.py
+@@ -69,6 +69,24 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
+             assert os.path.join("cache", "delegation") in path
+ 
+ 
++def test_valid_schema_output_is_not_truncated_or_made_invalid():
++    summary = '{"payload":"' + ("X" * 50_000) + '"}'
++    parent = _FakeParent(context_length=131_000, used_tokens=120_000, max_tokens=8_000)
++    results = [
++        {
++            "task_index": 0,
++            "summary": summary,
++            "status": "completed",
++            "schema_valid": True,
++        }
++    ]
++
++    dt._apply_summary_budget(results, parent)
++
++    assert results[0]["summary"] == summary
++    assert "summary_truncated" not in results[0]
++
++
+ def test_empty_results_is_noop():
+     # No summaries → nothing to do, must not raise.
+     dt._apply_summary_budget([], _FakeParent(131_000, 1_000, 8_000))
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 250c4dc62c..e5fad3d018 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1178,6 +1178,7 @@ def _build_child_system_prompt(
+     role: str = "leaf",
+     max_spawn_depth: int = 2,
+     child_depth: int = 1,
++    output_schema: Optional[Dict[str, Any]] = None,
+ ) -> str:
+     """Build a focused system prompt for a child agent.
+ 
+@@ -1228,20 +1229,32 @@ def _build_child_system_prompt(
+                 "below. Their conventions and invariants are binding for "
+                 "your work in this workspace.\n\n" + _ctx_files.strip()
+             )
+-    parts.append(
+-        "\nComplete this task using the tools available to you. "
+-        "When finished, provide a clear, concise summary of:\n"
+-        "- What you did\n"
+-        "- What you found or accomplished\n"
+-        "- Any files you created or modified\n"
+-        "- Any issues encountered\n\n"
++    completion_guidance = "\nComplete this task using the tools available to you. "
++    if output_schema is None:
++        completion_guidance += (
++            "When finished, provide a clear, concise summary of:\n"
++            "- What you did\n"
++            "- What you found or accomplished\n"
++            "- Any files you created or modified\n"
++            "- Any issues encountered\n\n"
++        )
++    else:
++        completion_guidance += (
++            "When finished, follow the OUTPUT CONTRACT at the end of this "
++            "system prompt exactly.\n\n"
++        )
++    completion_guidance += (
+         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
+-        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+-        "Keep your final summary tight: lead with outcomes, prefer bullet "
+-        "points over paragraphs, and don't replay your whole process. Your "
+-        "response is returned to the parent agent as a summary, and overlong "
+-        "summaries crowd out the parent's context window."
++        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands."
+     )
++    if output_schema is None:
++        completion_guidance += (
++            "\n\nKeep your final summary tight: lead with outcomes, prefer bullet "
++            "points over paragraphs, and don't replay your whole process. Your "
++            "response is returned to the parent agent as a summary, and overlong "
++            "summaries crowd out the parent's context window."
++        )
++    parts.append(completion_guidance)
+     if role == "orchestrator":
+         child_note = (
+             "Your own children MUST be leaves (cannot delegate further) "
+@@ -1253,6 +1266,15 @@ def _build_child_system_prompt(
+             "'leaf'; pass role='orchestrator' explicitly when a child "
+             "needs to further decompose its work."
+         )
++        orchestrator_completion = (
++            "Coordinate your workers' results and synthesize them before "
++            "producing the final JSON contract response. You are responsible "
++            "for that contract response, not your workers."
++            if output_schema is not None
++            else "Coordinate your workers' results and synthesize them before "
++            "reporting back to your parent. You are responsible for the "
++            "final summary, not your workers."
++        )
+         parts.append(
+             "\n## Subagent Spawning (Orchestrator Role)\n"
+             "You have access to the `delegate_task` tool and CAN spawn "
+@@ -1267,12 +1289,14 @@ def _build_child_system_prompt(
+             "- Trivial tasks you can execute in one or two tool calls.\n"
+             "- Re-delegating your entire assigned goal to one worker "
+             "(that's just pass-through with no value added).\n\n"
+-            "Coordinate your workers' results and synthesize them before "
+-            "reporting back to your parent. You are responsible for the "
+-            "final summary, not your workers.\n\n"
++            f"{orchestrator_completion}\n\n"
+             f"NOTE: You are at depth {child_depth}. The delegation tree "
+             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
+         )
++    if output_schema is not None:
++        from tools.delegation_output_schema import append_output_contract
++
++        parts.append("\n" + append_output_contract(None, output_schema))
+     return "\n".join(parts)
+ 
+ 
+@@ -1626,6 +1650,7 @@ def _build_child_agent(
+     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
+     # toolset subject to depth/kill-switch bounds applied below.
+     role: str = "leaf",
++    output_schema: Optional[Dict[str, Any]] = None,
+ ):
+     """
+     Build a child AIAgent on the main thread (thread-safe construction).
+@@ -1735,6 +1760,7 @@ def _build_child_agent(
+         role=effective_role,
+         max_spawn_depth=max_spawn,
+         child_depth=child_depth,
++        output_schema=output_schema,
+     )
+     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
+     parent_api_key = getattr(parent_agent, "api_key", None)
+@@ -2410,9 +2436,16 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
+     blowing the parent context and (on rate-limited providers) triggering a
+     compression/429 death spiral.
+     """
+-    summaries = [
++    all_summaries = [
+         r for r in results if isinstance(r, dict) and isinstance(r.get("summary"), str) and r["summary"]
+     ]
++    if not all_summaries:
++        return
++    # A machine-validated JSON response must remain byte-for-byte parseable by
++    # the parent. Truncating it into a head/tail window plus prose footer would
++    # turn a valid contract result into invalid JSON. Invalid/schema-less
++    # summaries remain eligible for the normal spill-and-trim path.
++    summaries = [r for r in all_summaries if r.get("schema_valid") is not True]
+     if not summaries:
+         return
+ 
+@@ -2422,7 +2455,7 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
+     except (TypeError, ValueError):
+         static_ceiling = DEFAULT_MAX_SUMMARY_CHARS
+ 
+-    dynamic_budget = _parent_summary_char_budget(parent_agent, len(summaries))
++    dynamic_budget = _parent_summary_char_budget(parent_agent, len(all_summaries))
+ 
+     # Combine the two caps. Either can be absent/disabled.
+     candidates = [c for c in (static_ceiling, dynamic_budget) if c and c > 0]
+@@ -2977,7 +3010,7 @@ def _run_single_child(
+             ):
+                 # Exactly one retry turn, carrying the validation errors
+                 # verbatim (no schema re-paste — the child already holds
+-                # the contract in its context).
++                # the contract in its system prompt).
+                 _schema_retries = 1
+                 _retry_result = None
+                 try:
+@@ -3866,14 +3899,11 @@ def delegate_task(
+         # Per-task role beats top-level; normalise again so unknown
+         # per-task values warn and degrade to leaf uniformly.
+         effective_role = _normalize_role(t.get("role") or top_role)
+-        # T1-24: schema'd tasks get the contract appended to their context
+-        # so the child knows the expected output shape before it starts.
++        # T1-24: schema'd tasks get the contract appended at the end of the
++        # child's system prompt so it overrides the generic prose-summary
++        # guidance and remains a first-class machine-validated requirement.
+         _task_schema = task_schemas[i] if i < len(task_schemas) else None
+         _child_context = t.get("context")
+-        if _task_schema is not None:
+-            from tools.delegation_output_schema import append_output_contract
+-
+-            _child_context = append_output_contract(_child_context, _task_schema)
+         try:
+             child = _build_child_preserving_parent_tools(
+                 task_index=i,
+@@ -3895,6 +3925,7 @@ def delegate_task(
+                 override_acp_command=creds.get("command"),
+                 override_acp_args=creds.get("args"),
+                 role=effective_role,
++                output_schema=_task_schema,
+             )
+         except ValueError as exc:
+             # Explicit-pin preflight failures (e.g. pinned delegation.command
+diff --git a/tools/delegation_output_schema.py b/tools/delegation_output_schema.py
+index e30a3c674a..659e27ae3d 100644
+--- a/tools/delegation_output_schema.py
++++ b/tools/delegation_output_schema.py
+@@ -1,8 +1,8 @@
+ """Structured-output schema helpers for delegate_task (T1-24).
+ 
+ Optional per-task ``output_schema`` (a JSON Schema object): the child is
+-told about the contract via an OUTPUT CONTRACT block appended to its
+-context, the parent validates the child's final answer with jsonschema,
++told about the contract via an OUTPUT CONTRACT block appended last in its
++system prompt, the parent validates the child's final answer with jsonschema,
+ and on failure sends exactly ONE bounded retry turn carrying the
+ validation errors verbatim (per llm-structured-output-schema-design:
+ max 1 retry, exact errors, no schema re-paste).
+@@ -61,47 +61,22 @@ def coerce_output_schema(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[s
+ 
+ 
+ def append_output_contract(context: Optional[str], schema: Dict[str, Any]) -> str:
+-    """Append the explicit output contract block to a child's context."""
++    """Append the explicit output contract block to optional base text."""
+     try:
+         schema_text = json.dumps(schema, indent=2, ensure_ascii=False)
+     except (TypeError, ValueError):
+         schema_text = str(schema)
+     block = (
+         f"{_CONTRACT_HEADER}:\n"
+-        "Your FINAL response must be a single JSON object that validates "
+-        "against this JSON Schema. No prose before or after the JSON; a "
+-        "```json code fence is acceptable but not required.\n"
++        "Your FINAL response must contain ONLY one raw JSON value that validates "
++        "against this JSON Schema. No Markdown or code fences. No prose, "
++        "commentary, explanation, or trailing text before or after the JSON.\n"
+         f"{schema_text}"
+     )
+     base = (context or "").rstrip()
+     return f"{base}\n\n{block}" if base else block
+ 
+ 
+-def extract_json_candidate(text: str) -> str:
+-    """Best-effort extraction of a JSON payload from model output.
+-
+-    Strips markdown code fences and leading/trailing prose around the
+-    outermost ``{...}`` / ``[...]`` span. Returns the (possibly unchanged)
+-    candidate string; parsing errors are reported by validate_output.
+-    """
+-    raw = (text or "").strip()
+-    if raw.startswith("```"):
+-        raw = raw.split("\n", 1)[-1]
+-        if raw.rstrip().endswith("```"):
+-            raw = raw.rstrip()[: -3]
+-        raw = raw.strip()
+-        if raw.lower().startswith("json\n"):
+-            raw = raw.split("\n", 1)[1]
+-    for opener, closer in (("{", "}"), ("[", "]")):
+-        if raw.startswith(opener):
+-            return raw
+-        start = raw.find(opener)
+-        end = raw.rfind(closer)
+-        if start >= 0 and end > start:
+-            return raw[start : end + 1]
+-    return raw
+-
+-
+ def validate_output(
+     text: str, schema: Dict[str, Any]
+ ) -> Tuple[bool, List[str]]:
+@@ -110,9 +85,9 @@ def validate_output(
+     Returns ``(True, [])`` on success or ``(False, errors)`` where errors
+     are human-readable strings suitable for the retry turn.
+     """
+-    candidate = extract_json_candidate(text or "")
++    candidate = (text or "").strip()
+     if not candidate.strip():
+-        return False, ["Response was empty — expected a JSON object matching the schema."]
++        return False, ["Response was empty — expected a JSON value matching the schema."]
+     try:
+         parsed = json.loads(candidate)
+     except (ValueError, TypeError) as exc:
+@@ -139,13 +114,13 @@ def build_retry_message(errors: List[str]) -> str:
+     """Build the single bounded retry turn sent to the child.
+ 
+     Carries the validation errors verbatim; deliberately does NOT
+-    re-paste the schema (the child already has it in its context).
++    re-paste the schema (the child already has it in its system prompt).
+     """
+     error_block = "\n".join(f"- {e}" for e in errors)
+     return (
+         "Your previous final response was rejected by the output contract "
+         "validator. Validation errors:\n"
+         f"{error_block}\n\n"
+-        "Reply with ONLY the corrected JSON object matching the OUTPUT "
+-        "CONTRACT schema from your task context. No prose, no explanations."
++        "Reply with ONLY the corrected raw JSON value matching the OUTPUT "
++        "CONTRACT schema from your system prompt. No Markdown, prose, or explanations."
+     )
