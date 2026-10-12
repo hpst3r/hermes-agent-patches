@@ -1,0 +1,575 @@
+From ce1bcef995bf400a38489f23b7df580e9ec1a44d Mon Sep 17 00:00:00 2001
+From: William Porter <liam@wporter.org>
+Date: Mon, 12 Oct 2026 11:35:44 -0400
+Subject: [PATCH 2/6] fix(desktop): stable virtual session list callbacks +
+ memoized rows (upstream PR #134041 by OutThisLife)
+
+---
+ ...irtual-session-list.render-budget.test.tsx | 275 ++++++++++++++++++
+ .../app/chat/sidebar/virtual-session-list.tsx | 223 +++++++++++---
+ 2 files changed, 460 insertions(+), 38 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/virtual-session-list.render-budget.test.tsx
+
+diff --git a/apps/desktop/src/app/chat/sidebar/virtual-session-list.render-budget.test.tsx b/apps/desktop/src/app/chat/sidebar/virtual-session-list.render-budget.test.tsx
+new file mode 100644
+index 0000000000..5bdb4bf776
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/virtual-session-list.render-budget.test.tsx
+@@ -0,0 +1,275 @@
++// @vitest-environment jsdom
++//
++// Render/measure budget for the sortable virtualized session list (#62964).
++//
++// The production OOM was allocation churn, not retained content: a 15s CPU
++// profile on an 11.5k-session profile was ~78% GC with top self time in dnd-kit
++// useSortable's items.slice and TanStack Virtual's measureElement. Those costs
++// only scale when the list re-renders (or rebuilds its measurements) per tick,
++// so the invariants here are COUNT bounds over a real mount of both libraries —
++// no module is stubbed into a fake that cannot loop.
++import type { useVirtualizer } from '@tanstack/react-virtual'
++import { act, cleanup, render } from '@testing-library/react'
++import * as React from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { SessionInfo } from '@/hermes'
++import type { SidebarListRow } from '@/lib/session-date-groups'
++
++import { ReorderableList } from './reorderable-list'
++import { VirtualSessionList } from './virtual-session-list'
++
++// ---------------------------------------------------------------------------
++// Real-library instrumentation
++// ---------------------------------------------------------------------------
++
++// The real virtualizer, wrapped only to count measureElement ref calls and to
++// expose the instance for size assertions. The wrap is assigned ONCE per
++// instance — a fresh wrapper each render would churn the ref identity itself.
++let measures = 0
++
++// A structural slice of the virtualizer the assertions need — the instance's
++// generic is internal; only getVirtualItems shape matters here.
++let instance: {
++  getVirtualItems: () => { index: number; key: unknown; size: number }[]
++  measureElement: (node: never) => unknown
++  elementsCache: Map<unknown, HTMLElement>
++} | null = null
++
++// The mocked module's own shape: importOriginal's type parameter cannot use an
++// inline `typeof import()` (lint forbids it), so it goes through the hoisted
++// type import above. Only the members the mock consumes need typing — the
++// spread carries the rest at runtime.
++type VirtualModule = { useVirtualizer: typeof useVirtualizer }
++
++vi.mock('@tanstack/react-virtual', async importOriginal => {
++  const original = await importOriginal<VirtualModule>()
++
++  return {
++    ...original,
++    useVirtualizer: (options: Parameters<typeof original.useVirtualizer>[0]) => {
++      const virtualizer = original.useVirtualizer(options)
++
++      const seen = virtualizer as unknown as {
++        __countedMeasureElement?: boolean
++        measureElement: (node: never) => unknown
++      }
++
++      if (!seen.__countedMeasureElement) {
++        const measure = seen.measureElement.bind(virtualizer)
++
++        seen.__countedMeasureElement = true
++        seen.measureElement = (node => {
++          measures += 1
++
++          return measure(node)
++        }) as typeof seen.measureElement
++      }
++
++      instance = virtualizer as unknown as typeof instance
++
++      return virtualizer
++    }
++  }
++})
++
++let rowRenders = 0
++
++vi.mock('./session-row', () => ({
++  // forwardRef like the real row: useSortable's setNodeRef must reach a DOM
++  // node or the droppable never measures.
++  SidebarSessionRow: React.forwardRef(function CountingRow(_props: unknown, ref: React.Ref<HTMLDivElement>) {
++    rowRenders += 1
++
++    return <div ref={ref} />
++  })
++}))
++
++vi.mock('./chrome', () => ({ SidebarDateDivider: () => null }))
++
++vi.mock('@/i18n', () => ({
++  useI18n: () => ({ t: { sidebar: { dateDivider: {} } } })
++}))
++
++// jsdom has no layout. The virtualizer sizes its viewport from
++// offsetWidth/offsetHeight (virtual-core getRect) and measures rows through
++// getBoundingClientRect; give both stable values so the range and the measured
++// sizes are real. Row heights are keyed by data-index.
++const VIEWPORT = { height: 600, width: 240 }
++const rowHeights = new Map<string, number>()
++
++beforeEach(() => {
++  const rect = (height: number, width: number) =>
++    ({
++      bottom: height,
++      height,
++      left: 0,
++      right: width,
++      top: 0,
++      width,
++      x: 0,
++      y: 0,
++      toJSON: () => ({})
++    }) as DOMRect
++
++  Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
++    configurable: true,
++    get(this: HTMLElement) {
++      // The scroller reports the viewport; a virtualized row (keyed by
++      // data-index) reports its own height so measurement reads real sizes.
++      const index = this.getAttribute('data-index')
++
++      return index != null ? (rowHeights.get(index) ?? 28) : VIEWPORT.height
++    }
++  })
++  Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
++    configurable: true,
++    get(this: HTMLElement) {
++      return VIEWPORT.width
++    }
++  })
++  vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
++    const index = this.getAttribute('data-index')
++
++    if (index != null) {
++      return rect(rowHeights.get(index) ?? 28, VIEWPORT.width)
++    }
++
++    return rect(VIEWPORT.height, VIEWPORT.width)
++  })
++})
++
++afterEach(() => {
++  cleanup()
++  vi.restoreAllMocks()
++  measures = 0
++  rowRenders = 0
++  instance = null
++  rowHeights.clear()
++})
++
++// ---------------------------------------------------------------------------
++// Harness
++// ---------------------------------------------------------------------------
++
++const session = (id: string, profile = 'default'): SessionInfo =>
++  ({ archived: false, id, last_active: 0, profile, started_at: 0 }) as unknown as SessionInfo
++
++const sessionRows = (count: number): SidebarListRow[] =>
++  Array.from({ length: count }, (_, i) => ({
++    entry: { session: session(`s${i}`) },
++    kind: 'session' as const
++  }))
++
++// The sortable wrapper consumes ids only; onReorder is inline like a real caller.
++const handleReorder = () => {}
++
++// A parent that re-renders on demand — the sidebar's real store ticks
++// (heartbeats, session refreshes, dot-state writes) all land as a prop-level
++// re-render of the section. Callbacks are inline, like the real caller's.
++function Harness({ ids, rows, sortable }: { ids: string[]; rows: SidebarListRow[]; sortable: boolean }) {
++  const [tick, setTick] = React.useState(0)
++
++  const bump = () => setTick(t => t + 1)
++
++  ;(window as unknown as { bumpTick: () => void }).bumpTick = bump
++
++  const virtual = (
++    <VirtualSessionList
++      activeSessionId={null}
++      onArchiveSession={() => {}}
++      onDeleteSession={() => {}}
++      onResumeSession={() => {}}
++      onTogglePin={() => {}}
++      onToggleUnread={() => {}}
++      pinned={false}
++      rows={rows}
++      sortable={sortable}
++    />
++  )
++
++  return sortable ? (
++    <ReorderableList ids={ids} onReorder={handleReorder}>
++      {virtual}
++    </ReorderableList>
++  ) : (
++    virtual
++  )
++}
++
++describe('VirtualSessionList render/measure budget (#62964)', () => {
++  it('an unrelated parent re-render re-renders no sortable rows and measures nothing new', () => {
++    const rows = sessionRows(120)
++    const ids = rows.map(row => (row.kind === 'session' ? row.entry.session.id : ''))
++
++    const { unmount } = render(<Harness ids={ids} rows={rows} sortable />)
++
++    // Baseline after mount settles: every mounted row rendered and measured
++    // exactly once.
++    const rowsAfterMount = rowRenders
++    const measuresAfterMount = measures
++
++    expect(rowsAfterMount).toBeGreaterThan(0)
++    expect(measuresAfterMount).toBeGreaterThan(0)
++
++    // Three no-op store ticks: same rows, inline callbacks (like the real
++    // caller) — only the parent re-renders, the way every sidebar store tick
++    // lands on the section. A row that re-renders here re-runs dnd-kit's
++    // O(items) useSortable work and re-arms the virtualizer's inline option
++    // closures — the per-tick churn that made launch OOM at 11.5k sessions.
++    const ticks = 3
++
++    for (let i = 0; i < ticks; i++) {
++      act(() => {
++        ;(window as unknown as { bumpTick: () => void }).bumpTick()
++      })
++    }
++
++    expect(rowRenders).toBe(rowsAfterMount)
++    expect(measures).toBe(measuresAfterMount)
++
++    unmount()
++  })
++
++  it('measures each mounted row exactly once for an N-item list', () => {
++    const rows = sessionRows(200)
++    const ids = rows.map(row => (row.kind === 'session' ? row.entry.session.id : ''))
++
++    render(<Harness ids={ids} rows={rows} sortable />)
++
++    const items = instance?.getVirtualItems() ?? []
++
++    // The mount budget: one measure per rendered row, no remeasure storm —
++    // the range plus overscan bounds how many rows exist at all.
++    expect(items.length).toBeGreaterThan(0)
++    expect(measures).toBe(items.length)
++  })
++
++  it('keys measurements by (profile, id): twins with one stored id keep their own sizes (#92454)', () => {
++    rowHeights.set('0', 28)
++    rowHeights.set('1', 45)
++
++    const rows: SidebarListRow[] = [
++      { entry: { session: session('twin', 'alpha') }, kind: 'session' },
++      { entry: { session: session('twin', 'beta') }, kind: 'session' }
++    ]
++
++    render(<Harness ids={[]} rows={rows} sortable={false} />)
++
++    // The density effect clears the size cache after the refs' first measure
++    // (that measure ran BEFORE the clear). In the real app the row
++    // ResizeObserver re-delivers the size right after; jsdom's observer is
++    // inert, so re-run the same ref measure the RO would fire.
++    act(() => {
++      instance?.elementsCache.forEach(node => instance?.measureElement(node as never))
++    })
++
++    const items = instance?.getVirtualItems() ?? []
++    const byIndex = new Map(items.map(item => [item.index, item]))
++
++    expect(byIndex.get(0)?.key).toBe('alpha::twin')
++    expect(byIndex.get(1)?.key).toBe('beta::twin')
++    expect(byIndex.get(0)?.size).toBe(28)
++    expect(byIndex.get(1)?.size).toBe(45)
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/virtual-session-list.tsx b/apps/desktop/src/app/chat/sidebar/virtual-session-list.tsx
+index 5406397453..fdc1e30777 100644
+--- a/apps/desktop/src/app/chat/sidebar/virtual-session-list.tsx
++++ b/apps/desktop/src/app/chat/sidebar/virtual-session-list.tsx
+@@ -3,7 +3,7 @@ import { CSS } from '@dnd-kit/utilities'
+ import { useStore } from '@nanostores/react'
+ import { useVirtualizer } from '@tanstack/react-virtual'
+ import type * as React from 'react'
+-import { type FC, useEffect, useRef } from 'react'
++import { type FC, memo, useCallback, useEffect, useRef } from 'react'
+ 
+ import type { SessionInfo } from '@/hermes'
+ import { useI18n } from '@/i18n'
+@@ -87,23 +87,53 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
+   const scrollerRef = useRef<HTMLDivElement | null>(null)
+   const density = useStore($sessionListDensity)
+ 
+-  const virtualizer = useVirtualizer({
+-    count: listRows.length,
+-    estimateSize: (index: number) => {
+-      const row = listRows[index]
++  // Option closures must be IDENTITY-STABLE across renders. The react-virtual
++  // adapter calls setOptions every render, and virtual-core's measurement
++  // memos key on these closures: a fresh estimateSize/getItemKey each render
++  // invalidated the memo and rebuilt the ENTIRE measurement cache (a fresh
++  // position/size array over every row) on every store tick — O(N) allocation
++  // churn that GC'd the renderer into a launch OOM at ~11.5k sessions
++  // (#62964). useCallback keeps them referentially equal while still reading
++  // the current rows/card through the refs.
++  const rowsRef = useRef(listRows)
++  rowsRef.current = listRows
++  const cardRef = useRef(card)
++  cardRef.current = card
++
++  const estimateSize = useCallback(
++    (index: number) => {
++      const row = rowsRef.current[index]
+ 
+       if (row?.kind === 'divider') {
+         return DIVIDER_ESTIMATE_PX
+       }
+ 
+-      return card ? SESSION_CARD_ROW_ESTIMATE_PX : sessionRowEstimate(density)
++      return cardRef.current ? SESSION_CARD_ROW_ESTIMATE_PX : sessionRowEstimate(density)
+     },
+-    getItemKey: index => {
+-      const row = listRows[index]
++    [density]
++  )
+ 
+-      return row ? (row.kind === 'divider' ? row.key : row.entry.session.id) : index
+-    },
+-    getScrollElement: () => scrollerRef.current,
++  // Key by (profile, id), matching the React row key: twins with one stored
++  // id across profiles are distinct rows (#92454) and must not share a
++  // measurement-cache slot — a bare id made each twin's measured size thrash
++  // the other's on every observe.
++  const getItemKey = useCallback((index: number) => {
++    const row = rowsRef.current[index]
++
++    if (!row) {
++      return index
++    }
++
++    return row.kind === 'divider' ? row.key : `${row.entry.session.profile ?? ''}::${row.entry.session.id}`
++  }, [])
++
++  const getScrollElement = useCallback(() => scrollerRef.current, [])
++
++  const virtualizer = useVirtualizer({
++    count: listRows.length,
++    estimateSize,
++    getItemKey,
++    getScrollElement,
+     // jsdom-friendly default; the real rect takes over on first observe.
+     initialRect: { height: 600, width: 240 },
+     overscan: OVERSCAN_ROWS
+@@ -114,6 +144,19 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
+   // off-screen rows re-enter (#88473).
+   useEffect(() => virtualizer.measure(), [card, density, virtualizer])
+ 
++  // Latest-handler bag: the row shells below are memoized on identity-stable
++  // inputs, so the caller's callbacks reach them through this ref (one stable
++  // object for the list's lifetime) instead of through per-row closures that
++  // would defeat the shell's memo. A store tick that touched no session then
++  // re-renders NOTHING in the list — the piece #62964 was missing. Handler
++  // swaps still take effect: the ref always reads the latest.
++  const handlersRef = useRef({ onArchiveSession, onBranchSession, onDeleteSession, onResumeSession, onTogglePin, onToggleUnread })
++  handlersRef.current = { onArchiveSession, onBranchSession, onDeleteSession, onResumeSession, onTogglePin, onToggleUnread }
++
++  // Stable measureElement prop for the shells (same identity as the
++  // virtualizer's own method; wrapping keeps the shell's memo honest).
++  const measure = useCallback((node: HTMLElement | null) => virtualizer.measureElement(node), [virtualizer])
++
+   const virtualItems = virtualizer.getVirtualItems()
+   const totalSize = virtualizer.getTotalSize()
+ 
+@@ -157,36 +200,35 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
+     }
+ 
+     const { branchStem, session } = row.entry
+-    const reorderable = sortable && !branchStem
+-
+-    const commonProps: SessionRowCommonProps = {
+-      branchStem,
+-      card,
+-      isPinned: pinned,
+-      isSelected: session.id === activeSessionId,
+-      onArchive: () => onArchiveSession(session.id),
+-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
+-      onDelete: () => onDeleteSession(session.id),
+-      onPin: () => onTogglePin(sessionPinId(session)),
+-      onToggleUnread: () => onToggleUnread(session.id),
+-      onResume: () => onResumeSession(session.id, session),
+-      reorderable,
+-      showProfile: showProfileTags,
+-      unread: session.unread === true
+-    }
+ 
+     // Key by (profile, id): twins with the same stored id in two profiles are
+     // distinct rows (#92454) — a bare-id key misattributes rendered state.
+     const rowKey = `${session.profile ?? ''}::${session.id}`
+ 
+-    return reorderable ? (
+-      <div data-index={virtualItem.index} key={rowKey} ref={virtualizer.measureElement} style={itemStyle}>
+-        <VirtualSortableRow rowProps={commonProps} session={session} />
+-      </div>
+-    ) : (
+-      <div data-index={virtualItem.index} key={rowKey} ref={virtualizer.measureElement} style={itemStyle}>
+-        <SidebarSessionRow {...commonProps} session={session} />
+-      </div>
++    // The row SHELL is memoized on identity-stable props only (session ref,
++    // geometry, primitive flags). A parent re-render that moved nothing
++    // re-renders no row: every mounted row's re-render would re-run dnd-kit's
++    // O(items) useSortable work (items.indexOf + items.slice for the
++    // resize-observer id list), which multiplied by the sidebar's per-tick
++    // re-renders was the launch OOM (#62964). Per-session callbacks bind
++    // inside the shell through the handler ref, so callback identity never
++    // re-renders a row and a handler swap still takes effect on next call.
++    return (
++      <VirtualRowShell
++        branchStem={branchStem}
++        card={card}
++        handlersRef={handlersRef}
++        index={virtualItem.index}
++        key={rowKey}
++        measure={measure}
++        pinned={pinned}
++        selected={session.id === activeSessionId}
++        session={session}
++        showProfile={showProfileTags}
++        sortable={sortable && !branchStem}
++        start={virtualItem.start}
++        unread={session.unread === true}
++      />
+     )
+   })
+ 
+@@ -220,13 +262,118 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
+   )
+ }
+ 
++/** The list-level callbacks a row shell reads through a latest-handler ref. */
++export interface VirtualSessionListHandlers {
++  onArchiveSession: (sessionId: string) => void
++  onBranchSession?: (sessionId: string, profile?: string) => void
++  onDeleteSession: (sessionId: string) => void
++  onResumeSession: (sessionId: string, session?: SessionInfo) => void
++  onTogglePin: (sessionId: string) => void
++  onToggleUnread: (sessionId: string) => void
++}
++
++interface VirtualRowShellProps {
++  branchStem: string | undefined
++  card: boolean
++  /** Latest-handler bag, identity-stable for the list's lifetime. */
++  handlersRef: React.RefObject<VirtualSessionListHandlers>
++  index: number
++  measure: (node: HTMLElement | null) => void
++  pinned: boolean
++  selected: boolean
++  session: SessionInfo
++  showProfile: boolean
++  sortable: boolean
++  start: number
++  unread: boolean
++}
++
++function virtualRowShellPropsEqual(a: VirtualRowShellProps, b: VirtualRowShellProps): boolean {
++  return (
++    a.session === b.session &&
++    a.branchStem === b.branchStem &&
++    a.card === b.card &&
++    a.handlersRef === b.handlersRef &&
++    a.index === b.index &&
++    a.measure === b.measure &&
++    a.pinned === b.pinned &&
++    a.selected === b.selected &&
++    a.showProfile === b.showProfile &&
++    a.sortable === b.sortable &&
++    a.start === b.start &&
++    a.unread === b.unread
++  )
++}
++
++/** The per-row prop bundle both row variants need, with per-session callbacks
++ * bound through the latest-handler ref (never through fresh closures — those
++ * would defeat the shell's memo). */
++function shellRowProps(
++  {
++    branchStem,
++    card,
++    handlersRef,
++    pinned,
++    selected,
++    showProfile,
++    sortable,
++    unread
++  }: Omit<VirtualRowShellProps, 'index' | 'measure' | 'session' | 'start'>,
++  session: SessionInfo
++): SessionRowCommonProps {
++  const handlers = handlersRef.current
++
++  return {
++    branchStem,
++    card,
++    isPinned: pinned,
++    isSelected: selected,
++    onArchive: () => handlers.onArchiveSession(session.id),
++    onBranch: handlers.onBranchSession ? () => handlers.onBranchSession?.(session.id, session.profile) : undefined,
++    onDelete: () => handlers.onDeleteSession(session.id),
++    onPin: () => handlers.onTogglePin(sessionPinId(session)),
++    onToggleUnread: () => handlers.onToggleUnread(session.id),
++    onResume: () => handlers.onResumeSession(session.id, session),
++    reorderable: sortable,
++    showProfile,
++    unread
++  }
++}
++
++/**
++ * One virtualized session row: the measured absolutely-positioned cell plus
++ * its sortable (dnd-kit) or plain row. Memoized on identity-stable inputs so
++ * a section re-render that changed nothing about THIS row renders nothing —
++ * the budget the render-budget test pins (#62964).
++ */
++const VirtualRowShell = memo(
++  function VirtualRowShell({ index, measure, session, sortable, start, ...flags }: VirtualRowShellProps) {
++    return (
++      <div
++        data-index={index}
++        ref={measure}
++        style={{ left: 0, position: 'absolute', top: 0, transform: `translateY(${start}px)`, width: '100%' }}
++      >
++        {sortable ? (
++          <VirtualSortableRow flags={flags} session={session} />
++        ) : (
++          <SidebarSessionRow {...shellRowProps({ ...flags, sortable: false }, session)} session={session} />
++        )}
++      </div>
++    )
++  },
++  virtualRowShellPropsEqual
++)
++
+ interface VirtualSortableRowProps {
+-  rowProps: SessionRowCommonProps
++  flags: Omit<VirtualRowShellProps, 'index' | 'measure' | 'session' | 'start' | 'sortable'>
+   session: SessionInfo
+ }
+ 
+-function VirtualSortableRow({ rowProps, session }: VirtualSortableRowProps) {
++function VirtualSortableRow({ flags, session }: VirtualSortableRowProps) {
+   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
++  // The sortable row IS reorderable by construction.
++  const rowProps = shellRowProps({ ...flags, sortable: true }, session)
+ 
+   return (
+     <SidebarSessionRow
+-- 
+2.56.0
+

@@ -1,0 +1,425 @@
+From bce2d9aac2c22bb18fbc707897c5adc8a74b04c1 Mon Sep 17 00:00:00 2001
+From: William Porter <liam@wporter.org>
+Date: Mon, 12 Oct 2026 11:40:08 -0400
+Subject: [PATCH 5/6] perf(desktop): unchanged pet/cron polls stop republishing
+ their atoms (salvage #103433) (upstream PR #128216 by kshitijk4poor)
+
+---
+ .../scripts/perf/scenarios/idle-cost.mjs      | 10 +-
+ .../src/components/pet/floating-pet.test.tsx  | 65 +++++++++++++
+ .../src/components/pet/floating-pet.tsx       |  4 +
+ apps/desktop/src/debug/watched-atoms.ts       |  4 +
+ apps/desktop/src/store/cron.test.ts           | 95 ++++++++++++++++++-
+ apps/desktop/src/store/cron.ts                | 68 ++++++++++++-
+ apps/desktop/src/store/pet.test.ts            | 18 +++-
+ 7 files changed, 257 insertions(+), 7 deletions(-)
+ create mode 100644 apps/desktop/src/components/pet/floating-pet.test.tsx
+
+diff --git a/apps/desktop/scripts/perf/scenarios/idle-cost.mjs b/apps/desktop/scripts/perf/scenarios/idle-cost.mjs
+index c378f96ad9..f9b848e56d 100644
+--- a/apps/desktop/scripts/perf/scenarios/idle-cost.mjs
++++ b/apps/desktop/scripts/perf/scenarios/idle-cost.mjs
+@@ -64,16 +64,21 @@ const reveal = sid => `window.__HERMES_LAYOUT_TREE__.reveal(${JSON.stringify(`se
+ const idleCost = seconds => `
+   (async () => {
+     const rc = window.__RENDER_COUNTS__
++    const ac = window.__ATOM_CHURN__
++    if (ac) ac.start()
+     rc.start()
+     const t0 = performance.now()
+     await new Promise(r => setTimeout(r, ${seconds} * 1000))
+     const elapsed = (performance.now() - t0) / 1000
+     rc.stop()
++    ac?.stop()
++    const churn = ac ? ac.report() : []
+     return JSON.stringify({
+       elapsed,
+       commits: rc.commits(),
+       top: rc.report(12),
+-      owners: rc.report(300).filter(r => r.stateChanged > 0 && r.propsChanged === 0).slice(0, 10)
++      owners: rc.report(300).filter(r => r.stateChanged > 0 && r.propsChanged === 0).slice(0, 10),
++      churn: churn.slice(0, 10)
+     })
+   })()
+ `
+@@ -252,6 +257,8 @@ export default {
+         // Commits per second with a turn open and nothing arriving. Should be 0.
+         idle_commits_per_s: round(idle.commits / idle.elapsed),
+         idle_renders: idle.top.reduce((a, r) => a + r.renders, 0),
++        idle_atom_churn: idle.churn ? idle.churn.reduce((a, c) => a + c.notifies, 0) : 0,
++        idle_wasted_churn: idle.churn ? idle.churn.reduce((a, c) => a + c.wasted, 0) : 0,
+         // Interaction smoothness while that churn competes for the main thread.
+         // Reported as a deficit from 60fps so "lower is better" matches the
+         // baseline gate's direction.
+@@ -274,6 +281,7 @@ export default {
+         // Components whose OWN state changed with no prop change: the roots.
+         idleOwners: idle.owners,
+         idleTop: idle.top,
++        idleChurn: idle.churn ?? [],
+         dragCommits: drag.commits,
+         dragTop: drag.top,
+         typeCommits: type.commits,
+diff --git a/apps/desktop/src/components/pet/floating-pet.test.tsx b/apps/desktop/src/components/pet/floating-pet.test.tsx
+new file mode 100644
+index 0000000000..59d64f0bbc
+--- /dev/null
++++ b/apps/desktop/src/components/pet/floating-pet.test.tsx
+@@ -0,0 +1,65 @@
++import { cleanup, render } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const { requestGateway } = vi.hoisted(() => ({
++  requestGateway: vi.fn()
++}))
++
++vi.mock('@/app/gateway/hooks/use-gateway-request', () => ({
++  useGatewayRequest: () => ({ requestGateway })
++}))
++
++vi.mock('@/themes/context', () => ({
++  useTheme: () => ({ resolvedMode: 'dark' })
++}))
++
++vi.mock('@/app/hooks/use-route-overlay-active', () => ({
++  useRouteOverlayActive: () => false
++}))
++
++vi.mock('@/app/hooks/use-on-profile-switch', () => ({
++  useOnProfileSwitch: () => {}
++}))
++
++import { $changeEventsAvailable } from '@/store/live-sync'
++import { $petInfo, setPetInfo } from '@/store/pet'
++import { $gatewayState } from '@/store/session'
++
++import { FloatingPet } from './floating-pet'
++
++describe('FloatingPet idle polling', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    $gatewayState.set('open')
++    $changeEventsAvailable.set(true)
++    setPetInfo({ enabled: false })
++    requestGateway.mockReset()
++    requestGateway.mockResolvedValue({ enabled: false })
++  })
++
++  afterEach(() => {
++    cleanup()
++    vi.useRealTimers()
++  })
++
++  it('does not mutate $petInfo or notify listeners when polling an already-disabled pet', async () => {
++    const initialPetInfo = $petInfo.get()
++    const listener = vi.fn()
++    const unsubscribe = $petInfo.listen(listener)
++
++    render(<FloatingPet />)
++
++    // Flush initial pull and startup retries
++    await vi.runOnlyPendingTimersAsync()
++    expect(requestGateway).toHaveBeenCalledWith('pet.info', expect.any(Object))
++
++    // Advance through startup retry intervals (1s, 3s, 8s) and backstop (15s)
++    await vi.advanceTimersByTimeAsync(20_000)
++
++    // The atom should NOT have notified any listeners because enabled: false remained false
++    expect(listener).not.toHaveBeenCalled()
++    expect($petInfo.get()).toBe(initialPetInfo)
++
++    unsubscribe()
++  })
++})
+diff --git a/apps/desktop/src/components/pet/floating-pet.tsx b/apps/desktop/src/components/pet/floating-pet.tsx
+index 64d8d4fcfb..cb3c105e89 100644
+--- a/apps/desktop/src/components/pet/floating-pet.tsx
++++ b/apps/desktop/src/components/pet/floating-pet.tsx
+@@ -206,6 +206,10 @@ export function FloatingPet() {
+             next.spritesheetBase64 = current.spritesheetBase64
+           }
+ 
++          if (!next.enabled && !current.enabled) {
++            return
++          }
++
+           if (
+             next.enabled &&
+             current.enabled &&
+diff --git a/apps/desktop/src/debug/watched-atoms.ts b/apps/desktop/src/debug/watched-atoms.ts
+index bc3957b49e..2c21e653cc 100644
+--- a/apps/desktop/src/debug/watched-atoms.ts
++++ b/apps/desktop/src/debug/watched-atoms.ts
+@@ -6,6 +6,8 @@
+ // question directly: while an agent is typing, what is being published, and
+ // who re-renders because of it?
+ 
++import { $cronJobs } from '@/store/cron'
++import { $petInfo } from '@/store/pet'
+ import { $projects, $projectTree } from '@/store/projects'
+ import {
+   $activeSessionId,
+@@ -60,10 +62,12 @@ const DERIVED = {
+  *  while an agent is typing, that is the bug. */
+ const SIDEBAR = {
+   $activeSessionId,
++  $cronJobs,
+   $cronSessions,
+   $currentCwd,
+   $gatewayState,
+   $messagingSessions,
++  $petInfo,
+   $projects,
+   $projectTree,
+   $selectedStoredSessionId,
+diff --git a/apps/desktop/src/store/cron.test.ts b/apps/desktop/src/store/cron.test.ts
+index 2e69343548..4c333e78e6 100644
+--- a/apps/desktop/src/store/cron.test.ts
++++ b/apps/desktop/src/store/cron.test.ts
+@@ -1,9 +1,19 @@
+-import { beforeEach, describe, expect, it } from 'vitest'
++import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { $cronJobs, beginCronJobsRequest, commitCronJobsRequest, setCronJobs, updateCronJobs } from './cron'
++import type { CronJob } from '@/types/hermes'
++
++import {
++  $cronJobs,
++  beginCronJobsRequest,
++  commitCronJobsRequest,
++  sameCronJob,
++  setCronJobs,
++  updateCronJobs
++} from './cron'
+ 
+ const oldJob = { id: 'old' } as never
+ const newJob = { id: 'new' } as never
++const jobA: CronJob = { enabled: true, id: 'job-a', name: 'Job A' } as CronJob
+ 
+ describe('cron jobs request fencing', () => {
+   beforeEach(() => {
+@@ -36,4 +46,85 @@ describe('cron jobs request fencing', () => {
+     expect(commitCronJobsRequest(poll, [oldJob])).toBe(false)
+     expect($cronJobs.get()).toEqual([newJob])
+   })
++
++  it('does not mutate $cronJobs or notify listeners when committing an identical job list', () => {
++    const listener = vi.fn()
++    const unsubscribe = $cronJobs.listen(listener)
++
++    const req = beginCronJobsRequest('all')
++    expect(commitCronJobsRequest(req, [])).toBe(true)
++    expect(listener).not.toHaveBeenCalled()
++
++    // Now set a non-empty job
++    setCronJobs([jobA])
++    listener.mockClear()
++
++    const req2 = beginCronJobsRequest('all')
++    expect(commitCronJobsRequest(req2, [{ ...jobA }])).toBe(true)
++    expect(listener).not.toHaveBeenCalled()
++
++    // And changing a job should notify
++    const req3 = beginCronJobsRequest('all')
++    expect(commitCronJobsRequest(req3, [{ ...jobA, name: 'Changed' }])).toBe(true)
++    expect(listener).toHaveBeenCalledTimes(1)
++
++    unsubscribe()
++  })
++})
++
++describe('CronJob structural comparator', () => {
++  const fullJob: CronJob = {
++    deliver: 'webhook',
++    enabled: true,
++    id: 'job-1',
++    last_error: null,
++    last_run_at: '2026-09-01T00:00:00Z',
++    model: 'gpt-4',
++    name: 'Full Job',
++    next_run_at: '2026-09-02T00:00:00Z',
++    no_agent: false,
++    prompt: 'Run task',
++    provider: 'openai',
++    schedule: {
++      display: 'Every day',
++      expr: '0 0 * * *',
++      kind: 'cron'
++    },
++    schedule_display: 'Every day at midnight',
++    script: 'run.sh',
++    state: 'idle'
++  }
++
++  it('detects changes in every CronJob interface field', () => {
++    const changedByField = {
++      deliver: { ...fullJob, deliver: 'email' },
++      enabled: { ...fullJob, enabled: false },
++      id: { ...fullJob, id: 'job-2' },
++      last_error: { ...fullJob, last_error: 'Failed' },
++      last_run_at: { ...fullJob, last_run_at: '2026-09-02T00:00:00Z' },
++      model: { ...fullJob, model: 'claude-3' },
++      name: { ...fullJob, name: 'Other' },
++      next_run_at: { ...fullJob, next_run_at: '2026-09-03T00:00:00Z' },
++      no_agent: { ...fullJob, no_agent: true },
++      prompt: { ...fullJob, prompt: 'New prompt' },
++      provider: { ...fullJob, provider: 'anthropic' },
++      schedule: { ...fullJob, schedule: undefined },
++      schedule_display: { ...fullJob, schedule_display: 'Changed display' },
++      script: { ...fullJob, script: 'other.sh' },
++      state: { ...fullJob, state: 'running' }
++    } satisfies Record<keyof CronJob, CronJob>
++
++    for (const [field, changedJob] of Object.entries(changedByField)) {
++      expect(sameCronJob(fullJob, changedJob), field).toBe(false)
++    }
++  })
++
++  it('detects changes in nested schedule fields', () => {
++    expect(sameCronJob(fullJob, { ...fullJob, schedule: { ...fullJob.schedule, kind: 'interval' } })).toBe(false)
++    expect(sameCronJob(fullJob, { ...fullJob, schedule: { ...fullJob.schedule, expr: '0 1 * * *' } })).toBe(false)
++    expect(sameCronJob(fullJob, { ...fullJob, schedule: { ...fullJob.schedule, display: 'Hourly' } })).toBe(false)
++    expect(sameCronJob(fullJob, { ...fullJob, schedule: undefined })).toBe(false)
++    expect(sameCronJob({ ...fullJob, schedule: undefined }, fullJob)).toBe(false)
++    expect(sameCronJob({ ...fullJob, schedule: undefined }, { ...fullJob, schedule: undefined })).toBe(true)
++  })
+ })
+diff --git a/apps/desktop/src/store/cron.ts b/apps/desktop/src/store/cron.ts
+index b6df8cb0fc..a20460becd 100644
+--- a/apps/desktop/src/store/cron.ts
++++ b/apps/desktop/src/store/cron.ts
+@@ -1,6 +1,6 @@
+ import { atom } from 'nanostores'
+ 
+-import type { CronJob } from '@/types/hermes'
++import type { CronJob, CronJobSchedule } from '@/types/hermes'
+ 
+ // Cron *jobs* (not run sessions) power the sidebar "Cron jobs" section. Listing
+ // the job — schedule, state, live next-run countdown — makes the job the
+@@ -57,6 +57,62 @@ export function invalidateCronJobsRequests(): void {
+   cronJobsScopeGeneration += 1
+ }
+ 
++function sameCronSchedule(a?: CronJobSchedule | null, b?: CronJobSchedule | null): boolean {
++  if (a === b) {
++    return true
++  }
++
++  if (!a && !b) {
++    return true
++  }
++
++  if (!a || !b) {
++    return false
++  }
++
++  return a.kind === b.kind && a.expr === b.expr && a.display === b.display
++}
++
++export function sameCronJob(a: CronJob, b: CronJob): boolean {
++  if (a === b) {
++    return true
++  }
++
++  return (
++    a.id === b.id &&
++    a.name === b.name &&
++    a.enabled === b.enabled &&
++    a.state === b.state &&
++    a.next_run_at === b.next_run_at &&
++    a.last_run_at === b.last_run_at &&
++    a.last_error === b.last_error &&
++    sameCronSchedule(a.schedule, b.schedule) &&
++    a.schedule_display === b.schedule_display &&
++    a.prompt === b.prompt &&
++    a.model === b.model &&
++    a.provider === b.provider &&
++    a.deliver === b.deliver &&
++    a.no_agent === b.no_agent &&
++    a.script === b.script
++  )
++}
++
++export function sameCronJobs(a: CronJob[], b: CronJob[]): boolean {
++  if (a === b) {
++    return true
++  }
++
++  if (a.length !== b.length) {
++    return false
++  }
++
++  return a.every((job, i) => {
++    const other = b[i]
++
++    return other != null && sameCronJob(job, other)
++  })
++}
++
+ export function commitCronJobsRequest(request: CronJobsRequest, jobs: CronJob[]): boolean {
+   if (!isCronJobsRequestCurrent(request)) {
+     return false
+@@ -65,14 +121,20 @@ export function commitCronJobsRequest(request: CronJobsRequest, jobs: CronJob[])
+   // Consume the token so neither a duplicate completion nor any older request
+   // can publish after this authoritative snapshot.
+   cronJobsRequestGeneration += 1
+-  $cronJobs.set(jobs)
++
++  if (!sameCronJobs($cronJobs.get(), jobs)) {
++    $cronJobs.set(jobs)
++  }
+ 
+   return true
+ }
+ 
+ export const setCronJobs = (jobs: CronJob[]) => {
+   cronJobsRequestGeneration += 1
+-  $cronJobs.set(jobs)
++
++  if (!sameCronJobs($cronJobs.get(), jobs)) {
++    $cronJobs.set(jobs)
++  }
+ }
+ 
+ // In-place edit so the cron overlay's mutations (create/edit/delete/pause/…)
+diff --git a/apps/desktop/src/store/pet.test.ts b/apps/desktop/src/store/pet.test.ts
+index f3add6f0bd..d257613dd3 100644
+--- a/apps/desktop/src/store/pet.test.ts
++++ b/apps/desktop/src/store/pet.test.ts
+@@ -5,13 +5,15 @@ import { createClientSessionState } from '@/lib/chat-runtime'
+ import {
+   $petActivity,
+   $petAtRest,
++  $petInfo,
+   $petMotion,
+   $petState,
+   derivePetState,
+   flashPetActivity,
+   hasPetSpriteForMeta,
+   mergePetInfoMeta,
+-  setPetActivity
++  setPetActivity,
++  setPetInfo
+ } from './pet'
+ import { $activeSessionId, $busy } from './session'
+ import { clearAllSessionStates, publishSessionState } from './session-states'
+@@ -152,3 +154,17 @@ describe('$petState reads the active runtime slice, not the $busy mirror (#84434
+     expect($petAtRest.get()).toBe(true)
+   })
+ })
++
++describe('setPetInfo', () => {
++  afterEach(() => setPetInfo({ enabled: false }))
++
++  it('keeps a scale change made while the pet is disabled', () => {
++    // The settings slider writes through setPetInfo({ ...current, scale })
++    // even before a sprite has loaded; the poll-side no-op guard must not
++    // swallow it.
++    setPetInfo({ enabled: false })
++    setPetInfo({ ...$petInfo.get(), scale: 1.5 })
++
++    expect($petInfo.get().scale).toBe(1.5)
++  })
++})
+-- 
+2.56.0
+

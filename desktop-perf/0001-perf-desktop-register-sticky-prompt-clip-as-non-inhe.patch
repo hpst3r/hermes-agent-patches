@@ -1,0 +1,105 @@
+From 6c35d513a12ddb7faf2db7e4bc088d537ac2ce00 Mon Sep 17 00:00:00 2001
+From: William Porter <liam@wporter.org>
+Date: Mon, 12 Oct 2026 11:35:40 -0400
+Subject: [PATCH 1/6] perf(desktop): register --sticky-prompt-clip as
+ non-inherited (upstream PR #133314 by UE2020)
+
+---
+ .../sticky-prompt-clip-registration.test.ts   | 37 +++++++++++++++++++
+ .../thread/use-sticky-prompt-clip.ts          |  4 ++
+ apps/desktop/src/styles.css                   | 20 ++++++++++
+ 3 files changed, 61 insertions(+)
+ create mode 100644 apps/desktop/src/components/assistant-ui/thread/sticky-prompt-clip-registration.test.ts
+
+diff --git a/apps/desktop/src/components/assistant-ui/thread/sticky-prompt-clip-registration.test.ts b/apps/desktop/src/components/assistant-ui/thread/sticky-prompt-clip-registration.test.ts
+new file mode 100644
+index 0000000000..1b20ddb624
+--- /dev/null
++++ b/apps/desktop/src/components/assistant-ui/thread/sticky-prompt-clip-registration.test.ts
+@@ -0,0 +1,37 @@
++import { readFileSync } from 'node:fs'
++import { resolve } from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++// `use-sticky-prompt-clip.ts` writes this value once per scroll frame onto
++// elements that are whole turns (markdown, code, tool output). If the property
++// stops being registered as a typed, NON-inherited property, every write goes
++// back to invalidating the element's entire subtree — a style recalculation per
++// frame on a long thread that also charges to whichever geometry read forces the
++// flush. Measured on a real scroll before the fix: 195 UpdateLayoutTree events,
++// 4,646ms total, 189ms worst.
++const STYLES = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8')
++
++const block = STYLES.match(/@property\s+--sticky-prompt-clip\s*\{[^}]*\}/)?.[0] ?? ''
++
++describe('--sticky-prompt-clip registration', () => {
++  it('is registered at all', () => {
++    expect(block).not.toBe('')
++  })
++
++  it('declares a typed length syntax so the write is a cheap property update', () => {
++    expect(block).toMatch(/syntax:\s*'<length>'/)
++  })
++
++  it('is non-inherited, so a write cannot invalidate every descendant', () => {
++    expect(block).toMatch(/inherits:\s*false/)
++  })
++
++  it('carries an initial value, so an unset property still means "no clip"', () => {
++    expect(block).toMatch(/initial-value:\s*0px/)
++  })
++
++  it('is the property the clip rule consumes', () => {
++    expect(STYLES).toContain('clip-path: inset(var(--sticky-prompt-clip) 0 0)')
++  })
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread/use-sticky-prompt-clip.ts b/apps/desktop/src/components/assistant-ui/thread/use-sticky-prompt-clip.ts
+index fdfb8a6301..2f7a192db1 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/use-sticky-prompt-clip.ts
++++ b/apps/desktop/src/components/assistant-ui/thread/use-sticky-prompt-clip.ts
+@@ -2,6 +2,10 @@ import { type ReactNode, type RefObject, useLayoutEffect, useRef } from 'react'
+ 
+ const GROUP = '[data-slot="aui_message-group"]'
+ const PROMPT = '[data-slot="aui_user-message-root"]'
++// Registered as a non-inherited <length> in styles.css. That registration is
++// load-bearing: this is written once per scroll frame onto elements that are
++// whole turns, and an unregistered property forces Blink to restyle every
++// descendant on each write. See the @property block there before changing it.
+ const CLIP = '--sticky-prompt-clip'
+ 
+ interface StickyPromptClipOptions {
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 219de06112..74d471f8a7 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -1867,6 +1867,26 @@ body.guest-pointer-lock :is(webview, iframe) {
+ 
+ /* The sticky prompt owns no field paint. Clip only the scrolling siblings
+    behind it, including the top gap, so bubble transparency still works. */
++/* REGISTERED AND NON-INHERITED ON PURPOSE — do not remove this block.
++   use-sticky-prompt-clip.ts writes this value on every scroll frame, onto the
++   very element that consumes it below, and those elements are whole turns
++   (markdown, code, tool output). An UNREGISTERED custom property cannot be
++   known to be uninherited, so Blink restyles the element AND every descendant
++   whenever it changes: on a scroll that is a full-subtree style recalculation
++   per frame. Measured on a real long-thread scroll (Chrome trace, 9.2s):
++   195 UpdateLayoutTree events totalling 4,646ms, worst single 189ms, with the
++   reads that force the flush attributed 3,706ms of getBoundingClientRect.
++
++   Declaring the syntax makes the value a typed <length>; `inherits: false`
++   lets Blink restyle just this element, which is all the clip needs — nothing
++   but this rule reads the value. The initial value keeps an unset property
++   equivalent to no clip, as before. */
++@property --sticky-prompt-clip {
++  syntax: '<length>';
++  inherits: false;
++  initial-value: 0px;
++}
++
+ [data-sticky-prompt-clip] {
+   clip-path: inset(var(--sticky-prompt-clip) 0 0);
+ }
+-- 
+2.56.0
+

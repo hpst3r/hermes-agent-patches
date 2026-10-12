@@ -1,0 +1,271 @@
+From 929c406509c3cecb4233472237cc6d387e68b3c5 Mon Sep 17 00:00:00 2001
+From: William Porter <liam@wporter.org>
+Date: Mon, 12 Oct 2026 11:40:07 -0400
+Subject: [PATCH 4/6] fix(desktop): session tiles stop re-rendering their chat
+ shell on unrelated sessions.changed ticks (#104094, salvage #104111)
+ (upstream PR #106604 by kshitijk4poor)
+
+---
+ .../src/app/chat/session-tile-owner.test.ts   | 43 ++++++++++++++-
+ .../src/app/chat/session-tile-owner.ts        | 32 +++++++++++
+ apps/desktop/src/app/chat/session-tile.tsx    | 54 ++++++++++++++-----
+ apps/desktop/src/store/session-states.ts      | 12 ++++-
+ .../src/store/session-tile-delegate.test.ts   | 35 ++++++++++++
+ 5 files changed, 162 insertions(+), 14 deletions(-)
+ create mode 100644 apps/desktop/src/store/session-tile-delegate.test.ts
+
+diff --git a/apps/desktop/src/app/chat/session-tile-owner.test.ts b/apps/desktop/src/app/chat/session-tile-owner.test.ts
+index 6df849b63a..4f1ad22f6d 100644
+--- a/apps/desktop/src/app/chat/session-tile-owner.test.ts
++++ b/apps/desktop/src/app/chat/session-tile-owner.test.ts
+@@ -4,7 +4,7 @@ import { _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/se
+ import type { SessionTile } from '@/store/session-states'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-import { tileOwnerRoute } from './session-tile-owner'
++import { ownerRouteFromKey, ownerRouteKey, tileOwnerRoute } from './session-tile-owner'
+ 
+ const row = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
+ 
+@@ -69,3 +69,44 @@ describe('tileOwnerRoute', () => {
+     expect(tileOwnerRoute([], [], 'missing')).toBeUndefined()
+   })
+ })
++
++describe('tileOwnerRoute key stability under session-list churn', () => {
++  it('keeps the current tile key when an UNRELATED row changes (sessions.changed tick)', () => {
++    const tiles = [tile({ storedSessionId: 'mine' })]
++    const mine = { connection_id: 'local', id: 'mine', profile: 'default' }
++    // The only difference is an unrelated row's last_active moving — exactly
++    // what a sessions.changed broadcast republishes for every profile.
++    const rowsBefore: SessionInfo[] = [row({ id: 'other-session', last_active: 100 }), row(mine)]
++    const rowsAfter: SessionInfo[] = [row({ id: 'other-session', last_active: 9_999 }), row(mine)]
++
++    expect(ownerRouteKey(tileOwnerRoute(tiles, rowsBefore, 'mine'))).toBe(
++      ownerRouteKey(tileOwnerRoute(tiles, rowsAfter, 'mine'))
++    )
++  })
++
++  it('changes the key when THIS tile owner actually re-homes', () => {
++    const tiles = [tile({ storedSessionId: 'mine' })]
++
++    expect(
++      ownerRouteKey(tileOwnerRoute(tiles, [row({ connection_id: 'local', id: 'mine', profile: 'default' })], 'mine'))
++    ).not.toBe(
++      ownerRouteKey(tileOwnerRoute(tiles, [row({ connection_id: 'remote', id: 'mine', profile: 'default' })], 'mine'))
++    )
++    // A target profile is part of the owner identity too, and an unresolved
++    // owner has no key at all.
++    expect(ownerRouteKey({ connectionId: 'local', profile: 'default' })).not.toBe(
++      ownerRouteKey({ connectionId: 'local', profile: 'default', targetProfile: 'tech-review' })
++    )
++    expect(ownerRouteKey(undefined)).toBeNull()
++
++    // The component rebuilds the route from the key; encoder and decoder must round-trip.
++    for (const route of [
++      { connectionId: 'local', profile: 'default' },
++      { connectionId: 'local', profile: 'default', targetProfile: 'tech-review' }
++    ]) {
++      expect(ownerRouteFromKey(ownerRouteKey(route))).toEqual(route)
++    }
++
++    expect(ownerRouteFromKey(null)).toBeUndefined()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/session-tile-owner.ts b/apps/desktop/src/app/chat/session-tile-owner.ts
+index 7b768fd023..82a779bdc3 100644
+--- a/apps/desktop/src/app/chat/session-tile-owner.ts
++++ b/apps/desktop/src/app/chat/session-tile-owner.ts
+@@ -35,3 +35,35 @@ export function tileOwnerRoute(
+     ...(owner.targetProfile ? { targetProfile: owner.targetProfile } : {})
+   }
+ }
++
++/**
++ * Stable scalar identity for a resolved tile owner route.
++ *
++ * `tileOwnerRoute` builds a fresh object on every call, so a component that
++ * derives the route through `useMemo` over a whole `$sessions` array re-creates
++ * it (and everything keyed on it) whenever the list is republished — which
++ * happens on every `sessions.changed` tick even when this tile's own row never
++ * moved (multi-profile / Bots setups tick every ~2s). Encoding the route as a
++ * string lets components subscribe through `useStoreSelector`/`useStoresSelector`
++ * instead: `Object.is` bails out when the owner fields are unchanged, so
++ * unrelated list churn stops at the subscription instead of re-rendering the
++ * tile's chat shell.
++ */
++export function ownerRouteKey(route: SessionOwnerRoute | undefined): string | null {
++  if (!route) {
++    return null
++  }
++
++  return `${route.connectionId}\u0000${route.profile}\u0000${route.targetProfile ?? ''}`
++}
++
++/** Inverse of `ownerRouteKey`; the two live together so the field order cannot drift. */
++export function ownerRouteFromKey(key: string | null): SessionOwnerRoute | undefined {
++  if (!key) {
++    return undefined
++  }
++
++  const [connectionId, profile, targetProfile] = key.split('\u0000')
++
++  return { connectionId, profile, ...(targetProfile ? { targetProfile } : {}) }
++}
+diff --git a/apps/desktop/src/app/chat/session-tile.tsx b/apps/desktop/src/app/chat/session-tile.tsx
+index 845144445f..5da8243c95 100644
+--- a/apps/desktop/src/app/chat/session-tile.tsx
++++ b/apps/desktop/src/app/chat/session-tile.tsx
+@@ -40,6 +40,7 @@ import { type ResolvedOwner, transcribeAudio } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import type { ChatMessage } from '@/lib/chat-messages'
+ import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
++import { useStoresSelector } from '@/lib/use-session-slice'
+ import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
+ import { createComposerAttachmentScope, draftTitleFor, takeSessionDraft } from '@/store/composer'
+ import { $gatewaySwitching } from '@/store/gateway-switch'
+@@ -54,6 +55,7 @@ import {
+   $messagingSessions,
+   $selectedStoredSessionId,
+   $sessions,
++  $unlistedSessionOwnerRows,
+   ownerLookupSessionRows,
+   sessionMatchesStoredId,
+   sessionPinId
+@@ -81,7 +83,7 @@ import { SessionDraftTitle } from './session-draft-title'
+ import { startSessionDrag } from './session-drag'
+ import { SessionStatusDot } from './session-status-dot'
+ import { useSessionTileActions } from './session-tile-actions'
+-import { tileOwnerRoute } from './session-tile-owner'
++import { ownerRouteFromKey, ownerRouteKey, tileOwnerRoute } from './session-tile-owner'
+ import { reasoningEffortPending, type SessionView, SessionViewProvider } from './session-view'
+ import { SessionContextMenu } from './sidebar/session-actions-menu'
+ import { lastVisibleMessageIsUser } from './thread-loading'
+@@ -254,19 +256,47 @@ function TileChat({
+   const queryClient = useQueryClient()
+ 
+   // Owner ladder, same as useSessionTileActions (session-tile-actions.ts:99-103).
+-  // Recomputed when the tile store or any owner-bearing session list changes,
+-  // NOT on every render: this component re-renders per streamed token, and the
+-  // lookup spreads three arrays before scanning them.
+-  const tiles = useStore($sessionTiles)
+-  const sessionRows = useStore($sessions)
+-  const cronRows = useStore($cronSessions)
+-  const messagingRows = useStore($messagingSessions)
++  // The route is derived through a SCALAR key instead of a `$sessions` array
++  // subscription: `$sessions` is republished whenever ANY row's last_active
++  // moves (a sessions.changed tick — multi-profile / Bots setups tick every
++  // ~2s), and `tileOwnerRoute` returns a fresh object per call, so a plain
++  // useMemo over the array would re-create the route — and with it
++  // `requestTileGateway`, `selectModel` and the model menu, all of which feed
++  // the memo'd ChatView — on every unrelated tick. The key only changes when
++  // THIS tile's owner fields change, so unrelated list churn stops at the
++  // `Object.is` bail-out and the tile's chat shell stays still.
++  //
++  // The selector runs on every render (this component re-renders per streamed
++  // token), so it reuses the last key while none of its inputs moved instead
++  // of re-concatenating and re-scanning the owner rows each time.
++  const ownerKeyCache = useRef<{ inputs: readonly unknown[]; key: null | string } | null>(null)
++
++  const ownerKey = useStoresSelector(
++    [$sessionTiles, $sessions, $cronSessions, $messagingSessions, $unlistedSessionOwnerRows],
++    () => {
++      const inputs = [
++        storedSessionId,
++        $sessionTiles.get(),
++        $sessions.get(),
++        $cronSessions.get(),
++        $messagingSessions.get(),
++        $unlistedSessionOwnerRows.get()
++      ]
++
++      const cached = ownerKeyCache.current
++
++      if (cached && cached.inputs.every((input, index) => input === inputs[index])) {
++        return cached.key
++      }
++
++      const key = ownerRouteKey(tileOwnerRoute($sessionTiles.get(), ownerLookupSessionRows(), storedSessionId))
++      ownerKeyCache.current = { inputs, key }
+ 
+-  const ownerRoute = useMemo(() => {
+-    const rows = cronRows.length || messagingRows.length ? [...sessionRows, ...cronRows, ...messagingRows] : sessionRows
++      return key
++    }
++  )
+ 
+-    return tileOwnerRoute(tiles, rows, storedSessionId)
+-  }, [cronRows, messagingRows, sessionRows, storedSessionId, tiles])
++  const ownerRoute = useMemo(() => ownerRouteFromKey(ownerKey), [ownerKey])
+ 
+   const requestTileGateway = useCallback(
+     <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> =>
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 3ec1898ecf..d1813dbfa7 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -2286,9 +2286,19 @@ export interface AcceptedSessionIdentity {
+ let delegate: SessionTileDelegate | null = null
+ export const $sessionTileDelegateRevision = atom(0)
+ 
++/** Bumped when a delegate first becomes available, so tiles that tried to
++ *  resume before the wiring mounted retry. Re-registering a replacement (the
++ *  wiring rebuilds it whenever one of its callbacks changes identity, which
++ *  includes every sessions.changed tick) must not bump it: every tile pane
++ *  subscribes, and a bump re-renders each tile's whole chat shell. Actions
++ *  read the current delegate at call time, so a replacement needs no signal. */
+ export function setSessionTileDelegate(next: SessionTileDelegate) {
++  const firstDelegate = delegate === null
+   delegate = next
+-  $sessionTileDelegateRevision.set($sessionTileDelegateRevision.get() + 1)
++
++  if (firstDelegate) {
++    $sessionTileDelegateRevision.set($sessionTileDelegateRevision.get() + 1)
++  }
+ }
+ 
+ export function sessionTileDelegate(): SessionTileDelegate | null {
+diff --git a/apps/desktop/src/store/session-tile-delegate.test.ts b/apps/desktop/src/store/session-tile-delegate.test.ts
+new file mode 100644
+index 0000000000..c9dd973c04
+--- /dev/null
++++ b/apps/desktop/src/store/session-tile-delegate.test.ts
+@@ -0,0 +1,35 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { SessionTileDelegate } from './session-states'
++
++const fakeDelegate = () => ({}) as unknown as SessionTileDelegate
++
++describe('session tile delegate revision', () => {
++  beforeEach(() => {
++    vi.resetModules()
++  })
++
++  it('wakes tiles when a delegate first arrives, not when it is replaced', async () => {
++    // Every tile pane subscribes to the revision, and the wiring re-registers
++    // its delegate whenever a callback changes identity (every sessions.changed
++    // tick): a bump per replacement re-rendered every tile's chat shell.
++    const { $sessionTileDelegateRevision, sessionTileDelegate, setSessionTileDelegate } =
++      await import('./session-states')
++
++    const notify = vi.fn()
++    const stop = $sessionTileDelegateRevision.listen(notify)
++
++    const first = fakeDelegate()
++    setSessionTileDelegate(first)
++    expect(notify).toHaveBeenCalledTimes(1)
++
++    const replacement = fakeDelegate()
++    setSessionTileDelegate(fakeDelegate())
++    setSessionTileDelegate(replacement)
++    expect(notify).toHaveBeenCalledTimes(1)
++    // Actions read the delegate at call time, so they still get the latest.
++    expect(sessionTileDelegate()).toBe(replacement)
++
++    stop()
++  })
++})
+-- 
+2.56.0
+

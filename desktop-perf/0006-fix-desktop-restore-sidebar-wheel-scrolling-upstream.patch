@@ -1,0 +1,312 @@
+From 81c23f6394c0ba59c6f7d402a28efca9f95aa7d0 Mon Sep 17 00:00:00 2001
+From: William Porter <liam@wporter.org>
+Date: Mon, 12 Oct 2026 11:40:08 -0400
+Subject: [PATCH 6/6] fix(desktop): restore sidebar wheel scrolling (upstream
+ PR #88195 by royalaid)
+
+---
+ apps/desktop/e2e/sidebar-wheel-scroll.spec.ts | 135 ++++++++++++++++++
+ .../app/chat/sidebar/cron-jobs-section.tsx    |   2 +-
+ apps/desktop/src/app/chat/sidebar/index.tsx   |  47 ++----
+ .../src/app/chat/sidebar/sessions-section.tsx |  15 +-
+ 4 files changed, 156 insertions(+), 43 deletions(-)
+ create mode 100644 apps/desktop/e2e/sidebar-wheel-scroll.spec.ts
+
+diff --git a/apps/desktop/e2e/sidebar-wheel-scroll.spec.ts b/apps/desktop/e2e/sidebar-wheel-scroll.spec.ts
+new file mode 100644
+index 0000000000..6d21443557
+--- /dev/null
++++ b/apps/desktop/e2e/sidebar-wheel-scroll.spec.ts
+@@ -0,0 +1,135 @@
++import { expect, type Locator, type Page, test } from '@playwright/test'
++
++import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
++
++interface SidebarLayout {
++  contentOverflowY: string
++  sectionBodyOverflows: string[]
++  navBottom: number
++  profileTop: number
++  sectionsBottom: number
++  sectionsOverflowY: string
++  sectionsTop: number
++  sidebarBottom: number
++  sidebarTop: number
++}
++
++async function scrollMetrics(
++  target: Locator
++): Promise<{ clientHeight: number; scrollHeight: number; scrollTop: number }> {
++  return target.first().evaluate(element => {
++    let owner: HTMLElement | null = element as HTMLElement
++
++    while (owner && !['auto', 'scroll'].includes(getComputedStyle(owner).overflowY)) {
++      owner = owner.parentElement
++    }
++
++    if (!owner) {
++      throw new Error('No vertical scroll owner found')
++    }
++
++    return { clientHeight: owner.clientHeight, scrollHeight: owner.scrollHeight, scrollTop: owner.scrollTop }
++  })
++}
++
++async function resetScroll(target: Locator): Promise<void> {
++  await target.first().evaluate(element => {
++    let owner: HTMLElement | null = element as HTMLElement
++
++    while (owner && !['auto', 'scroll'].includes(getComputedStyle(owner).overflowY)) {
++      owner = owner.parentElement
++    }
++
++    owner?.scrollTo({ top: 0 })
++  })
++}
++
++async function sidebarLayout(page: Page): Promise<SidebarLayout> {
++  return page.evaluate(() => {
++    const sections = document.querySelector<HTMLElement>('[data-sidebar-sections]')!
++    const sidebar = sections.closest<HTMLElement>('[data-slot="sidebar"]')!
++    const content = sections.closest<HTMLElement>('[data-sidebar="content"]')!
++    const nav = content.firstElementChild as HTMLElement
++    const profile = content.lastElementChild as HTMLElement
++    const bodies = [...sections.querySelectorAll<HTMLElement>('[data-sidebar="group-content"]')]
++    const sidebarRect = sidebar.getBoundingClientRect()
++    const sectionsRect = sections.getBoundingClientRect()
++
++    return {
++      contentOverflowY: getComputedStyle(content).overflowY,
++      navBottom: nav.getBoundingClientRect().bottom,
++      profileTop: profile.getBoundingClientRect().top,
++      sectionBodyOverflows: bodies.map(body => getComputedStyle(body).overflowY),
++      sectionsBottom: sectionsRect.bottom,
++      sectionsOverflowY: getComputedStyle(sections).overflowY,
++      sectionsTop: sectionsRect.top,
++      sidebarBottom: sidebarRect.bottom,
++      sidebarTop: sidebarRect.top
++    }
++  })
++}
++
++function expectAnchoredLayout(layout: SidebarLayout): void {
++  expect(layout.contentOverflowY).toBe('hidden')
++  expect(layout.sectionsOverflowY).toBe('auto')
++  expect(layout.sectionBodyOverflows.length).toBeGreaterThan(0)
++  expect(layout.sectionBodyOverflows.every(overflow => overflow === 'visible')).toBe(true)
++  expect(layout.navBottom).toBeLessThanOrEqual(layout.sectionsTop)
++  expect(layout.sectionsBottom).toBeLessThanOrEqual(layout.profileTop)
++  expect(layout.profileTop).toBeGreaterThanOrEqual(layout.sidebarTop)
++  expect(layout.profileTop).toBeLessThan(layout.sidebarBottom)
++}
++
++test.describe('sidebar wheel scrolling', () => {
++  test.setTimeout(180_000)
++
++  let fixture: MockBackendFixture
++
++  test.beforeAll(async () => {
++    fixture = await setupMockBackend()
++    await waitForAppReady(fixture, 120_000)
++  })
++
++  test.afterAll(async () => {
++    await fixture?.cleanup()
++  })
++
++  test('anchors shell chrome while the section stack scrolls from headers and rows', async () => {
++    const { app, page } = fixture
++
++    const composer = page.locator('[contenteditable="true"]').first()
++    await composer.click()
++    await composer.fill('Create a sidebar session for the layout check')
++    await page.keyboard.press('Enter')
++    await page.locator('[data-sidebar-sections]').waitFor({ state: 'visible', timeout: 30_000 })
++
++    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(1220, 800))
++    await page.waitForTimeout(250)
++    expectAnchoredLayout(await sidebarLayout(page))
++
++    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(1000, 560))
++    await page.waitForTimeout(250)
++    expectAnchoredLayout(await sidebarLayout(page))
++
++    await page.locator('[data-sidebar-sections]').evaluate(sections => {
++      const filler = document.createElement('div')
++      filler.dataset.scrollFixture = ''
++      filler.style.flex = '0 0 800px'
++      sections.append(filler)
++    })
++
++    const row = page.locator('[data-sidebar-sections] [data-slot="row-button"]').last()
++    const header = page.locator('[data-sidebar-sections] button').first()
++    const beforeHeader = await scrollMetrics(header)
++
++    expect(beforeHeader.scrollHeight).toBeGreaterThan(beforeHeader.clientHeight)
++    await header.hover()
++    await page.mouse.wheel(0, 500)
++    await expect.poll(async () => (await scrollMetrics(header)).scrollTop).toBeGreaterThan(beforeHeader.scrollTop)
++
++    await resetScroll(header)
++    await row.hover()
++    await page.mouse.wheel(0, 500)
++    await expect.poll(async () => (await scrollMetrics(row)).scrollTop).toBeGreaterThan(0)
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx b/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx
+index 3002491ce9..dcdb2cfe77 100644
+--- a/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx
++++ b/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx
+@@ -198,7 +198,7 @@ export function SidebarCronJobsSection({
+         </button>
+       </div>
+       {open && (
+-        <SidebarGroupContent className="scrollbar-fade flex max-h-72 flex-col gap-px overflow-x-hidden overflow-y-auto overscroll-contain pb-1.75 compact:max-h-none compact:overflow-visible">
++        <SidebarGroupContent className="flex max-h-none flex-col gap-px overflow-visible pb-1.75">
+           {shown.map(job => (
+             <CronJobSidebarRow
+               busy={triggeringJobIds.has(job.id)}
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index dadfd889c0..2e22d7ce58 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -188,7 +188,7 @@ import {
+   SidebarStorageCorruptNotice
+ } from './section-states'
+ import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
+-import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
++import { SidebarSessionsSection } from './sessions-section'
+ import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
+ import { useEnteredProjectSessions } from './use-entered-project-sessions'
+ import { useServerSessionSearch } from './use-server-session-search'
+@@ -248,24 +248,21 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
+   }
+ ]
+ 
+-// Two modes via the `compact` height variant (styles.css):
+-//   tall    → each section is shrink-0, capped, its own scroller; Sessions is flex-1.
+-//   compact → COMPACT_FLAT drops the caps so the whole stack scrolls as one.
+-// Sections stay shrink-0 so none can be squeezed below its content and bleed onto
+-// the next — the flexbox `min-height: auto` overlap trap that caused the bug.
+-const COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
+-
+ // Vertical scroll only — never a horizontal bar from glow bleed, long titles,
+ // etc. The bar itself only shows while the pointer is in the list.
+ const SCROLL_Y = 'overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-fade'
++const NESTED_SCROLL_Y = 'overflow-y-auto overflow-x-hidden scrollbar-fade'
+ 
+ // The outer list reserves its bar's width whether or not one is showing, so
+ // filtering or collapsing a section doesn't reflow every row sideways. Only the
+ // outer one: nested scrollers would each reserve their own and stack the inset.
+ const SCROLL_GUTTER = '[scrollbar-gutter:stable]'
+ 
+-// A non-session group's scroll body: own scroller when tall, flattened when compact.
+-const GROUP_BODY = cn(SCROLL_Y, COMPACT_FLAT)
++// The section stack is the sidebar's one ordinary scroll authority. Individual
++// groups stay visible inside it so wheel input over rows, switches, or headers
++// all moves the same surface. The virtualized recents list remains the sole
++// exception and chains into this outer scroller at its boundaries.
++const GROUP_BODY = 'max-h-none overflow-visible'
+ 
+ // Section-header action icons stay hidden until the whole header row is hovered
+ // (group/section lives on SidebarSectionHeader), mirroring the artifacts/file
+@@ -1452,11 +1449,6 @@ export function ChatSidebar({
+ 
+   const displayAgentGroups = profileGroups
+ 
+-  // The recents list owns its own (virtualized) scroll container only when it's a
+-  // long flat list. In that case it must keep its scroller even in short mode, so
+-  // we don't flatten it (flattening would defeat virtualization). Short flat lists
+-  // and grouped views (profile groups or the worktree tree) flatten into the
+-  // single outer scroll instead.
+   // Whichever grouping is active, the flat set of repo subtrees on screen — the
+   // single source for reconciling repo/worktree order, whether repos hang off
+   // the bare tree or are nested under projects.
+@@ -1465,18 +1457,6 @@ export function ChatSidebar({
+     [agentProjectTree]
+   )
+ 
+-  // Mirror the section's own virtualization inputs (the props it receives),
+-  // not the raw tree cache: agentProjectTree persists after leaving Project
+-  // grouping, and keying on it here while the section keys on projectOverview
+-  // (which is nulled the moment grouping changes) left the two disagreeing —
+-  // wrapper classes built for a virtualized list around a non-virtual one.
+-  // Entered-project content is the third prop that suppresses virtualization.
+-  const recentsVirtualizes =
+-    !displayAgentGroups?.length &&
+-    !projectOverview?.length &&
+-    !(inProject && enteredProjectContent) &&
+-    displayAgentSessions.length >= VIRTUALIZE_THRESHOLD
+-
+   // Keep the persisted parent + worktree orders reconciled with what's on screen:
+   // freshly-seen repos/worktrees surface at the top, vanished ones drop out of
+   // the saved order.
+@@ -1728,11 +1708,12 @@ export function ChatSidebar({
+             className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y, SCROLL_GUTTER)}
+             data-sessions-mode={sessionsMode}
+             data-sessions-project={inProject ? (enteredProjectId ?? undefined) : undefined}
++            data-sidebar-sections=""
+           >
+             {trimmedQuery && (
+               <SidebarSessionsSection
+                 activeSessionId={activeSidebarSessionId}
+-                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
++                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', NESTED_SCROLL_Y)}
+                 emptyState={
+                   searchPending ? (
+                     <SidebarSessionSkeletons />
+@@ -1806,10 +1787,7 @@ export function ChatSidebar({
+                   // two — a cached project tree flipped this side but not the
+                   // section's, leaving the list with no scroller at all and
+                   // the recents pane rendering blank under Updated grouping.
+-                  SCROLL_Y,
+-                  // Flatten into the single scroll when compact — unless this is the
+-                  // virtualized long list, which must keep its own scroller.
+-                  !recentsVirtualizes && COMPACT_FLAT
++                  NESTED_SCROLL_Y
+                 )}
+                 dndSensors={dndSensors}
+                 emptyState={
+@@ -1976,10 +1954,7 @@ export function ChatSidebar({
+                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
+                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
+                 removedSessionIds={inProject ? removedSessionIds : undefined}
+-                rootClassName={cn(
+-                  'min-h-32 flex-1 overflow-hidden p-0',
+-                  !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
+-                )}
++                rootClassName="min-h-20 flex-1 overflow-hidden p-0 compact:min-h-0"
+                 sessions={displayAgentSessions}
+                 sortable={!showAllProfiles && agentSessions.length > 1}
+               />
+diff --git a/apps/desktop/src/app/chat/sidebar/sessions-section.tsx b/apps/desktop/src/app/chat/sidebar/sessions-section.tsx
+index cc310f655a..48f3c9bd3e 100644
+--- a/apps/desktop/src/app/chat/sidebar/sessions-section.tsx
++++ b/apps/desktop/src/app/chat/sidebar/sessions-section.tsx
+@@ -617,14 +617,17 @@ export function SidebarSessionsSection({
+     inner = visibleRows.map(row => renderListRow(row, false, dividerAction))
+   }
+ 
+-  // The virtualizer owns its own scroller, so suppress the wrapper's overflow
+-  // to avoid a double scroll container. Both axes: `overflow-y-visible` next
+-  // to the inherited `overflow-x-hidden` computes to `auto` (CSS spec), which
+-  // kept a phantom 4px scrollbar gutter and cut every row short on the right.
+-  const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-visible')
++  // Ordinary sections are content inside the sidebar's one outer scroller.
++  // The virtualizer still receives the original contentClassName and owns its
++  // bounded viewport, while its wrapper stays visible to avoid a double scroll
++  // container and gutter. Non-virtual roots must also release the old flex/clip
++  // constraints or their content expands behind an inert hidden viewport.
++  const resolvedContentClassName = cn(contentClassName, 'max-h-none overflow-visible')
++
++  const resolvedRootClassName = cn(rootClassName, !flatVirtualized && 'min-h-0 flex-none shrink-0 overflow-visible')
+ 
+   return (
+-    <SidebarGroup className={rootClassName}>
++    <SidebarGroup className={resolvedRootClassName}>
+       <SidebarSectionHeader
+         action={headerAction}
+         collapsible={collapsible}
+-- 
+2.56.0
+

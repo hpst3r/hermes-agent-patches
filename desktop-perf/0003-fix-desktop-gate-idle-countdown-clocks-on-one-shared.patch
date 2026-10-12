@@ -1,0 +1,279 @@
+From 9b24df4de38e96da9267bf81fbece73a4c50a251 Mon Sep 17 00:00:00 2001
+From: William Porter <liam@wporter.org>
+Date: Mon, 12 Oct 2026 11:40:07 -0400
+Subject: [PATCH 3/6] fix(desktop): gate idle countdown clocks on one shared
+ viewed 1s ticker (upstream PR #122446 by whyyagswhy)
+
+---
+ .../app/chat/sidebar/cron-jobs-section.tsx    |  19 ++-
+ .../desktop/src/hooks/use-idle-clock.test.tsx | 108 ++++++++++++++++++
+ apps/desktop/src/hooks/use-idle-clock.ts      |  98 ++++++++++++++++
+ 3 files changed, 213 insertions(+), 12 deletions(-)
+ create mode 100644 apps/desktop/src/hooks/use-idle-clock.test.tsx
+ create mode 100644 apps/desktop/src/hooks/use-idle-clock.ts
+
+diff --git a/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx b/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx
+index 816629d742..3002491ce9 100644
+--- a/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx
++++ b/apps/desktop/src/app/chat/sidebar/cron-jobs-section.tsx
+@@ -10,6 +10,7 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
+ import { Tip } from '@/components/ui/tooltip'
+ import { deleteCronJob, getCronJobRuns, pauseCronJob, resumeCronJob, type SessionInfo } from '@/hermes'
++import { useIdleClock } from '@/hooks/use-idle-clock'
+ import { useI18n } from '@/i18n'
+ import { fmtDayTime, relativeTime } from '@/lib/time'
+ import { cn } from '@/lib/utils'
+@@ -101,7 +102,11 @@ export function SidebarCronJobsSection({
+   onToggle,
+   open
+ }: SidebarCronJobsSectionProps) {
+-  const [nowMs, setNowMs] = useState(() => Date.now())
++  // #122413: countdowns share the single visibility+focus-gated 1s ticker
++  // (useIdleClock) instead of a private always-on interval per mount.
++  // Rows are pure and take nowMs as a prop; formatting uses the memoized
++  // Intl instances in lib/time and the font comes from the --dt-font-sans
++  // theme var, so a parked tick changes nothing and renders nothing.
+   // Single-open inline peek so the section stays scannable.
+   const [peekJobId, setPeekJobId] = useState<null | string>(null)
+   // Rows revealed so far; starts compact, grows in steps via "load more".
+@@ -148,17 +153,7 @@ export function SidebarCronJobsSection({
+ 
+   const visible = usePaneVisible()
+ 
+-  // One clock for the whole section (rows are pure) so the countdowns tick
+-  // without re-rendering the rest of the sidebar. Only runs while expanded and visible.
+-  useEffect(() => {
+-    if (!open || !visible) {
+-      return
+-    }
+-
+-    const id = window.setInterval(() => setNowMs(Date.now()), 1000)
+-
+-    return () => window.clearInterval(id)
+-  }, [open, visible])
++  const nowMs = useIdleClock(open && visible)
+ 
+   // Upcoming first (soonest next run), jobs with no next run sink to the bottom,
+   // then alphabetical for stability.
+diff --git a/apps/desktop/src/hooks/use-idle-clock.test.tsx b/apps/desktop/src/hooks/use-idle-clock.test.tsx
+new file mode 100644
+index 0000000000..9bd29ee8d1
+--- /dev/null
++++ b/apps/desktop/src/hooks/use-idle-clock.test.tsx
+@@ -0,0 +1,108 @@
++// @vitest-environment jsdom
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { IDLE_TICK_MS, useIdleClock } from './use-idle-clock'
++
++let visibility: DocumentVisibilityState = 'visible'
++let focused = true
++
++function setViewed(viewed: boolean): void {
++  visibility = viewed ? 'visible' : 'hidden'
++  focused = viewed
++  window.document.dispatchEvent(new Event('visibilitychange'))
++  window.dispatchEvent(new Event(viewed ? 'focus' : 'blur'))
++}
++
++describe('useIdleClock', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    vi.spyOn(window.document, 'visibilityState', 'get').mockImplementation(() => visibility)
++    vi.spyOn(window.document, 'hasFocus').mockImplementation(() => focused)
++    visibility = 'visible'
++    focused = true
++  })
++
++  afterEach(() => {
++    cleanup()
++    vi.useRealTimers()
++    vi.restoreAllMocks()
++  })
++
++  // #122413: the sidebar cron countdowns and the heartbeat countdown each ran
++  // their own always-on 1s setInterval, keeping the visible-idle renderer hot.
++  it('ticks about once a second while the window is viewed', () => {
++    const { result } = renderHook(() => useIdleClock(true))
++    const start = result.current
++
++    act(() => {
++      vi.advanceTimersByTime(IDLE_TICK_MS * 3 + 50)
++    })
++
++    expect(result.current).toBeGreaterThan(start)
++  })
++
++  it('parks the tick while hidden and catches up on return', () => {
++    const { result } = renderHook(() => useIdleClock(true))
++    const setIntervalSpy = vi.spyOn(window, 'setInterval')
++
++    act(() => {
++      setViewed(false)
++    })
++    const parked = result.current
++    setIntervalSpy.mockClear()
++
++    act(() => {
++      vi.advanceTimersByTime(IDLE_TICK_MS * 5)
++    })
++
++    expect(result.current).toBe(parked)
++    expect(setIntervalSpy).not.toHaveBeenCalled()
++
++    act(() => {
++      setViewed(true)
++    })
++
++    // Leading tick on return — the UI catches up immediately, no stale countdown.
++    expect(result.current).toBeGreaterThanOrEqual(parked)
++  })
++
++  it('starts no timer while disabled', () => {
++    const setIntervalSpy = vi.spyOn(window, 'setInterval')
++    const { result } = renderHook(() => useIdleClock(false))
++
++    act(() => {
++      vi.advanceTimersByTime(IDLE_TICK_MS * 3)
++    })
++
++    expect(setIntervalSpy).not.toHaveBeenCalled()
++    expect(typeof result.current).toBe('number')
++  })
++
++  it('shares one underlying interval across mounted consumers', () => {
++    const setIntervalSpy = vi.spyOn(window, 'setInterval')
++    const first = renderHook(() => useIdleClock(true))
++    const second = renderHook(() => useIdleClock(true))
++
++    expect(setIntervalSpy).toHaveBeenCalledTimes(1)
++
++    act(() => {
++      vi.advanceTimersByTime(IDLE_TICK_MS + 50)
++    })
++
++    // One shared tick drives every consumer — no per-clock timer multiplication.
++    expect(second.result.current).toBe(first.result.current)
++
++    first.unmount()
++    second.unmount()
++  })
++
++  it('clears the shared interval once the last consumer leaves', () => {
++    const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
++    const { unmount } = renderHook(() => useIdleClock(true))
++
++    unmount()
++
++    expect(clearIntervalSpy).toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/hooks/use-idle-clock.ts b/apps/desktop/src/hooks/use-idle-clock.ts
+new file mode 100644
+index 0000000000..d134e49b2d
+--- /dev/null
++++ b/apps/desktop/src/hooks/use-idle-clock.ts
+@@ -0,0 +1,98 @@
++import { useEffect, useState } from 'react'
++
++/** The one cadence every idle countdown/count-up label shares. */
++export const IDLE_TICK_MS = 1000
++
++type TickListener = () => void
++
++/** Subscribers to the single shared interval — N clocks, one timer. */
++const listeners = new Set<TickListener>()
++let intervalId: number | null = null
++
++function isViewed(): boolean {
++  return typeof document !== 'undefined' && document.visibilityState === 'visible' && document.hasFocus()
++}
++
++function notify(): void {
++  for (const listener of [...listeners]) {
++    listener()
++  }
++}
++
++function sync(): void {
++  if (listeners.size === 0) {
++    return
++  }
++
++  if (!isViewed()) {
++    // Parked: hidden or unfocused while always-mounted clocks stay subscribed.
++    // Clearing the interval (instead of skipping inside it) means zero wakeups.
++    if (intervalId !== null) {
++      window.clearInterval(intervalId)
++      intervalId = null
++    }
++
++    return
++  }
++
++  if (intervalId === null) {
++    // Leading tick on (re)entry so countdowns catch up immediately; a tick
++    // that changes nothing sets identical state and React bails out.
++    notify()
++    intervalId = window.setInterval(notify, IDLE_TICK_MS)
++  }
++}
++
++function unsubscribe(listener: TickListener): void {
++  listeners.delete(listener)
++
++  if (listeners.size === 0) {
++    if (intervalId !== null) {
++      window.clearInterval(intervalId)
++      intervalId = null
++    }
++
++    window.removeEventListener('focus', sync)
++    window.removeEventListener('blur', sync)
++    document.removeEventListener('visibilitychange', sync)
++  }
++}
++
++function subscribe(listener: TickListener): () => void {
++  const first = listeners.size === 0
++  listeners.add(listener)
++
++  if (first) {
++    window.addEventListener('focus', sync)
++    window.addEventListener('blur', sync)
++    document.addEventListener('visibilitychange', sync)
++  }
++
++  sync()
++
++  return () => {
++    unsubscribe(listener)
++  }
++}
++
++/** Shared visibility+focus-gated 1s `nowMs` for idle countdown/count-up labels.
++ *
++ * #122413: every per-second clock ran its own always-on `setInterval`, so a
++ * visible-but-untouched window re-rendered (and re-resolved date formatters +
++ * fonts) every second forever. Consumers share one interval that only runs
++ * while the document is actually being viewed; while parked there are zero
++ * wakeups, and a tick that changes nothing produces no re-render.
++ */
++export function useIdleClock(enabled = true): number {
++  const [nowMs, setNowMs] = useState(() => Date.now())
++
++  useEffect(() => {
++    if (!enabled) {
++      return
++    }
++
++    return subscribe(() => setNowMs(Date.now()))
++  }, [enabled])
++
++  return nowMs
++}
+-- 
+2.56.0
+
