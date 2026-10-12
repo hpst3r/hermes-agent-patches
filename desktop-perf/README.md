@@ -26,9 +26,10 @@ Deliberately **not** included: [#98644](https://github.com/NousResearch/hermes-a
   `json-subagent-output` patch.
 - `git am --3way` applies all six cleanly onto upstream `main` at `7cc3fb8cb5` (2026-10-12).
 - Desktop checks on the picked tree: `npm run typecheck` clean, eslint clean on the
-  changed files, and the vitest `ui` project for the touched directories. The new
-  tests from #133314 and #134041 are included; with patches 1–2 alone, the sidebar and
-  thread tests gave 47 files / 362 tests passing.
+  changed files. The vitest `ui` project over the touched directories
+  (`src/app/chat/sidebar`, `src/app/chat/session-tile-owner.test.ts`,
+  `src/components/assistant-ui/thread`, `src/components/pet`, `src/hooks`, `src/store`)
+  passed **291 files / 2,753 tests**. That run includes the PRs' new regression tests.
 
 SHA-256:
 
